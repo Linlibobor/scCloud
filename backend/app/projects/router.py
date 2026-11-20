@@ -201,8 +201,9 @@ async def download_project(
     db: Session = Depends(get_db),
 ):
     """Download all project files as a ZIP archive, organized by analysis step."""
+    import errno
+    import uuid
     import zipfile
-    import tempfile
 
     project = (
         db.query(Project)
@@ -247,6 +248,12 @@ async def download_project(
     def _clean_name(fn):
         return _ts_re.sub("_", fn)
 
+    def _safe_unlink(path: str) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     # (step, clean_name) -> (mtime, file_path)
     file_map = {}
 
@@ -265,17 +272,31 @@ async def download_project(
             if key not in file_map or mt > file_map[key][0]:
                 file_map[key] = (mt, fp)
 
-    tmp_path = os.path.join(tempfile.gettempdir(), f"sccloud_{project_id}_{timestamp}.zip")
-    with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for (step, clean), (mt, fp) in sorted(file_map.items()):
-            folder = STEP_DIR.get(step, "_Other")
-            arc = os.path.join(project.name, folder, clean)
-            try:
-                zf.write(fp, arc)
-            except OSError:
-                pass
+    # 写入持久化卷下的 _tmp/exports，避免撑爆容器 128MB /tmp tmpfs；
+    # 使用唯一文件名防并发覆盖，并在异常时立刻清理残留半成品。
+    export_dir = get_settings().export_tmp_dir
+    os.makedirs(export_dir, exist_ok=True)
+    tmp_path = os.path.join(
+        export_dir,
+        f"sccloud_{project_id}_{timestamp}_{uuid.uuid4().hex[:8]}.zip",
+    )
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for (step, clean), (mt, fp) in sorted(file_map.items()):
+                folder = STEP_DIR.get(step, "_Other")
+                arc = os.path.join(project.name, folder, clean)
+                try:
+                    zf.write(fp, arc)
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        raise
+                    # 单个源文件消失或无权读取时跳过，其余文件照常打包
+                    pass
+    except BaseException:
+        _safe_unlink(tmp_path)
+        raise
 
-    background_tasks.add_task(os.unlink, tmp_path)
+    background_tasks.add_task(_safe_unlink, tmp_path)
     return FileResponse(
         tmp_path,
         media_type="application/zip",

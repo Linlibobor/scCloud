@@ -10,7 +10,9 @@ scCloud v2 — 分片上传路由
 前端使用 File.slice() 分割文件，并行/顺序上传每一片。
 """
 
+import json
 import os
+import re
 import shutil
 import uuid
 
@@ -23,8 +25,20 @@ from app.db.models import User
 
 router = APIRouter(prefix="/api/upload", tags=["文件上传"])
 
-# 临时分片存储目录
-CHUNK_DIR = "/tmp/sccloud_chunks"
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _get_chunk_root() -> str:
+    """分片临时存储根目录（放在 projects_root/_tmp/chunks，避免 128MB /tmp tmpfs 满盘）。"""
+    root = get_settings().upload_chunk_dir
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _chunk_dir_for(upload_id: str) -> str:
+    if not _UPLOAD_ID_RE.match(upload_id or ""):
+        raise HTTPException(status_code=400, detail="无效的 Upload ID")
+    return os.path.join(_get_chunk_root(), upload_id)
 
 
 class InitUploadResponse(BaseModel):
@@ -83,7 +97,7 @@ async def init_upload(
         )
 
     upload_id = uuid.uuid4().hex
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     os.makedirs(chunk_dir, exist_ok=True)
 
     # 保存元数据
@@ -107,7 +121,7 @@ async def upload_chunk(
     上传单个分片。
     前端使用 File.slice(start, end) 切片后逐个上传。
     """
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
 
@@ -147,7 +161,7 @@ async def complete_upload(
             detail="操作配额使用结束，无法继续进行。",
         )
 
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
 
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
@@ -317,7 +331,7 @@ async def inspect_file(
     通过 R 引擎 /inspect 端点解析，支持 .rds, .h5ad, .h5seurat 格式。
     """
 
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
 
@@ -468,7 +482,7 @@ async def upload_status(
     current_user: User = Depends(get_current_user),
 ):
     """查询上传进度 — 返回已接收的分片数量。"""
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
 

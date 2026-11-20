@@ -93,6 +93,16 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     _bootstrap_admin_if_empty()
     _cleanup_stale_tasks()
+    try:
+        tmp_res = data_cleanup.cleanup_stale_tmp()
+        if tmp_res["removed"] > 0:
+            logger.info(
+                "[startup] 清理过期临时文件 %d 个，释放 %.1f MB",
+                tmp_res["removed"],
+                tmp_res["freed_mb"],
+            )
+    except Exception as e:
+        logger.warning("[startup] 清理临时文件失败: %s", e)
     # 重任务改走 Redis 队列 + worker(#42 Phase2)，无需再初始化引擎池。
     # 启动 Redis → DB 进度同步器 (后台协程)
     syncer = ProgressSyncer()
