@@ -3,6 +3,7 @@
 # 用法：sh ./tests/test_start_sh.sh
 
 set -u
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy SCCLOUD_ASSUME_TTY
 
 REPO_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/sccloud-start-tests.XXXXXX")
@@ -133,10 +134,20 @@ if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
   if [ "${MOCK_ALL_LOCAL_IMAGES:-0}" = "1" ]; then
     exit 0
   fi
+  if [ -n "${MOCK_PULL_SUCCEED_ON_PROXY_FILE:-}" ] && [ -f "$MOCK_PULL_SUCCEED_ON_PROXY_FILE" ]; then
+    exit 0
+  fi
   case " ${MOCK_LOCAL_IMAGES:-} " in
     *" ${ref} "*) exit 0 ;;
     *) exit 1 ;;
   esac
+fi
+
+if [ "${1:-}" = "ps" ]; then
+  if [ -n "${MOCK_RUNNING_CONTAINERS:-}" ]; then
+    printf '%s\n' "$MOCK_RUNNING_CONTAINERS"
+  fi
+  exit 0
 fi
 
 if [ "${1:-}" = "tag" ]; then
@@ -164,6 +175,10 @@ if [ "${1:-}" = "compose" ]; then
       exit 1
       ;;
     pull)
+      if [ -n "${MOCK_PULL_SUCCEED_ON_PROXY_FILE:-}" ] && [ -f "$MOCK_PULL_SUCCEED_ON_PROXY_FILE" ]; then
+        echo "Pull complete via synced proxy"
+        exit 0
+      fi
       [ -n "${MOCK_PULL_MSG:-}" ] && printf '%s\n' "$MOCK_PULL_MSG" >&2
       exit "${MOCK_PULL_RC:-0}"
       ;;
@@ -203,6 +218,19 @@ if [ "${1:-}" != "-n" ]; then
   exit 99
 fi
 exit "${MOCK_SUDO_RC:-1}"
+EOF
+
+  # ---- mock systemctl ----
+  cat > "$sb/fake-bin/systemctl" <<'EOF'
+#!/bin/sh
+set -u
+[ -n "${MOCK_SYSTEMCTL_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_SYSTEMCTL_LOG"
+case " $* " in
+  *" is-active "*)
+    exit "${MOCK_SYSTEMCTL_ACTIVE_RC:-0}"
+    ;;
+esac
+exit 0
 EOF
 
   # ---- mock ss ----
@@ -339,7 +367,7 @@ ok_u3=1
 [ "$rc" -eq 0 ] || { fail "U3" "expected exit 0, got $rc"; ok_u3=0; }
 assert_contains "U3" "$out" "Docker daemon 未配置代理" || ok_u3=0
 # shellcheck disable=SC2088
-assert_contains "U3" "$out" "~/.config/systemd/user/docker.service.d/http-proxy.conf" || ok_u3=0
+assert_contains "U3" "$out" "~/.config/systemd/user/docker.service.d/sccloud-proxy.conf" || ok_u3=0
 [ "$ok_u3" = "1" ] && pass "U3: 识别 Shell 与 rootless dockerd 代理错位并输出 drop-in 配置"
 
 # ---------------- U4: pull 超时不回退 build ----------------
@@ -604,6 +632,141 @@ if grep -q 'exec' "$dlog"; then
   ok_u14=0
 fi
 [ "$ok_u14" = "1" ] && pass "U14: sccloud-ops.sh 支持 SCCLOUD_ROOTLESS/SCLOUD_ROOTLESS 且拦截非法用户名"
+
+# ---------------- U15: 交互式 pull 超时自动同步代理并重试成功 ----------------
+sb=$(setup_sandbox u15)
+dlog="$sb/docker.log"
+slog="$sb/systemctl.log"
+mkdir -p "$sb/home/.config/systemd/user/docker.service.d"
+printf '# existing user proxy\n' > "$sb/home/.config/systemd/user/docker.service.d/http-proxy.conf"
+conf_file="$sb/home/.config/systemd/user/docker.service.d/sccloud-proxy.conf"
+out=$(
+  cd "$sb" && \
+  printf 'y\n' | env -u XDG_CONFIG_HOME PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    HTTPS_PROXY="http://127.0.0.1:7890" \
+    SCCLOUD_ASSUME_TTY=1 \
+    MOCK_DOCKER_LOG="$dlog" MOCK_SYSTEMCTL_LOG="$slog" \
+    MOCK_DOCKER_ROOTLESS=1 MOCK_DOCKER_HTTP_PROXY="" MOCK_DOCKER_HTTPS_PROXY="" \
+    MOCK_RUNNING_CONTAINERS="  - other-job-1 (Up 2 hours)" \
+    MOCK_PULL_RC=1 MOCK_PULL_MSG='dial tcp 1.2.3.4:443: i/o timeout' \
+    MOCK_PULL_SUCCEED_ON_PROXY_FILE="$conf_file" \
+    sh ./start.sh 2>&1
+)
+rc=$?
+ok_u15=1
+[ "$rc" -eq 0 ] || { fail "U15" "expected exit 0 after retry, got $rc"; ok_u15=0; }
+assert_contains "U15" "$out" "有 1 个正在运行的容器" || ok_u15=0
+assert_contains "U15" "$out" "other-job-1" || ok_u15=0
+assert_contains "U15" "$out" "自动重试镜像拉取" || ok_u15=0
+[ -f "$conf_file" ] || { fail "U15" "sccloud-proxy.conf was not written"; ok_u15=0; }
+grep -q 'Environment="HTTPS_PROXY=http://127.0.0.1:7890"' "$conf_file" 2>/dev/null || { fail "U15" "HTTPS_PROXY missing in sccloud-proxy.conf"; ok_u15=0; }
+grep -q '# existing user proxy' "$sb/home/.config/systemd/user/docker.service.d/http-proxy.conf" || { fail "U15" "existing http-proxy.conf was modified!"; ok_u15=0; }
+grep -q -- '--user daemon-reload' "$slog" 2>/dev/null || { fail "U15" "systemctl --user daemon-reload not called"; ok_u15=0; }
+grep -q -- '--user restart docker' "$slog" 2>/dev/null || { fail "U15" "systemctl --user restart docker not called"; ok_u15=0; }
+[ "$(grep -Ec '^compose .* pull$' "$dlog")" -eq 2 ] || { fail "U15" "expected exactly 2 compose pull attempts"; ok_u15=0; }
+[ "$ok_u15" = "1" ] && pass "U15: 交互确认 y 后自动写 sccloud-proxy.conf、重启 dockerd 并自动重试拉取成功"
+
+# ---------------- U16: 交互式 pull 超时选择 N 不修改代理也不 build ----------------
+sb=$(setup_sandbox u16)
+dlog="$sb/docker.log"
+slog="$sb/systemctl.log"
+conf_file="$sb/home/.config/systemd/user/docker.service.d/sccloud-proxy.conf"
+out=$(
+  cd "$sb" && \
+  printf 'n\n' | env -u XDG_CONFIG_HOME PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    HTTPS_PROXY="http://127.0.0.1:7890" \
+    SCCLOUD_ASSUME_TTY=1 \
+    MOCK_DOCKER_LOG="$dlog" MOCK_SYSTEMCTL_LOG="$slog" \
+    MOCK_DOCKER_ROOTLESS=1 MOCK_DOCKER_HTTP_PROXY="" MOCK_DOCKER_HTTPS_PROXY="" \
+    MOCK_PULL_RC=1 MOCK_PULL_MSG='dial tcp 1.2.3.4:443: i/o timeout' \
+    MOCK_LOCAL_IMAGES="" \
+    sh ./start.sh 2>&1
+)
+rc=$?
+ok_u16=1
+[ "$rc" -ne 0 ] || { fail "U16" "expected non-zero exit when declining proxy sync"; ok_u16=0; }
+[ ! -e "$conf_file" ] || { fail "U16" "sccloud-proxy.conf must not be written when user answers n"; ok_u16=0; }
+if grep -q 'restart docker' "$slog" 2>/dev/null; then
+  fail "U16" "systemctl restart must not be called when user answers n"
+  ok_u16=0
+fi
+if grep -Eq '^compose .* build' "$dlog" 2>/dev/null; then
+  fail "U16" "build must not be called"
+  ok_u16=0
+fi
+[ "$ok_u16" = "1" ] && pass "U16: 交互回答 n 时不改配置、不重启 dockerd、不回退 build"
+
+# ---------------- U17: 非交互终端 pull 超时不阻塞且提示 --sync-proxy ----------------
+sb=$(setup_sandbox u17)
+conf_file="$sb/home/.config/systemd/user/docker.service.d/sccloud-proxy.conf"
+out=$(
+  cd "$sb" && \
+  env -u XDG_CONFIG_HOME PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    HTTPS_PROXY="http://127.0.0.1:7890" \
+    MOCK_DOCKER_ROOTLESS=1 MOCK_DOCKER_HTTP_PROXY="" MOCK_DOCKER_HTTPS_PROXY="" \
+    MOCK_PULL_RC=1 MOCK_PULL_MSG='dial tcp 1.2.3.4:443: i/o timeout' \
+    MOCK_LOCAL_IMAGES="" \
+    sh ./start.sh </dev/null 2>&1
+)
+rc=$?
+ok_u17=1
+[ "$rc" -ne 0 ] || { fail "U17" "expected non-zero exit"; ok_u17=0; }
+[ ! -e "$conf_file" ] || { fail "U17" "non-interactive run must not write sccloud-proxy.conf"; ok_u17=0; }
+assert_contains "U17" "$out" "--sync-proxy" || ok_u17=0
+[ "$ok_u17" = "1" ] && pass "U17: 非交互终端不阻塞等待输入，明确提示 --sync-proxy"
+
+# ---------------- U18: --sync-proxy 显式同步与 --clear-proxy 对称清理 ----------------
+sb=$(setup_sandbox u18)
+slog="$sb/systemctl.log"
+mkdir -p "$sb/home/.config/systemd/user/docker.service.d"
+printf '# keep me\n' > "$sb/home/.config/systemd/user/docker.service.d/http-proxy.conf"
+conf_file="$sb/home/.config/systemd/user/docker.service.d/sccloud-proxy.conf"
+out_sync=$(
+  cd "$sb" && \
+  env -u XDG_CONFIG_HOME PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    HTTPS_PROXY="http://127.0.0.1:7890" NO_PROXY="10.0.0.0/8" \
+    MOCK_SYSTEMCTL_LOG="$slog" MOCK_DOCKER_ROOTLESS=1 \
+    MOCK_PULL_SUCCEED_ON_PROXY_FILE="$conf_file" \
+    sh ./start.sh --sync-proxy 2>&1
+)
+rc_sync=$?
+ok_u18=1
+[ "$rc_sync" -eq 0 ] || { fail "U18" "--sync-proxy failed with rc=$rc_sync"; ok_u18=0; }
+[ -f "$conf_file" ] || { fail "U18" "sccloud-proxy.conf missing after --sync-proxy"; ok_u18=0; }
+grep -q 'Environment="NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8"' "$conf_file" 2>/dev/null || { fail "U18" "NO_PROXY merge failed"; ok_u18=0; }
+
+: > "$slog"
+out_clear=$(
+  cd "$sb" && \
+  env -u XDG_CONFIG_HOME PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_SYSTEMCTL_LOG="$slog" MOCK_DOCKER_ROOTLESS=1 \
+    sh ./start.sh --clear-proxy 2>&1
+)
+rc_clear=$?
+[ "$rc_clear" -eq 0 ] || { fail "U18" "--clear-proxy failed with rc=$rc_clear"; ok_u18=0; }
+[ ! -e "$conf_file" ] || { fail "U18" "sccloud-proxy.conf still exists after --clear-proxy"; ok_u18=0; }
+grep -q '# keep me' "$sb/home/.config/systemd/user/docker.service.d/http-proxy.conf" || { fail "U18" "--clear-proxy must preserve existing http-proxy.conf"; ok_u18=0; }
+grep -q -- '--user restart docker' "$slog" 2>/dev/null || { fail "U18" "--clear-proxy did not restart docker"; ok_u18=0; }
+assert_contains "U18" "$out_sync" "已同步代理" || ok_u18=0
+assert_contains "U18" "$out_clear" "恢复 Docker daemon 直连" || ok_u18=0
+[ "$ok_u18" = "1" ] && pass "U18: --sync-proxy 合并 NO_PROXY 写入，--clear-proxy 仅清理 sccloud-proxy.conf"
+
+# ---------------- U19: 非法代理 URL 拒绝写入 ----------------
+sb=$(setup_sandbox u19)
+conf_file="$sb/home/.config/systemd/user/docker.service.d/sccloud-proxy.conf"
+out=$(
+  cd "$sb" && \
+  env -u XDG_CONFIG_HOME PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    HTTPS_PROXY='http://127.0.0.1:7890" bad' \
+    MOCK_DOCKER_ROOTLESS=1 MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --sync-proxy 2>&1
+)
+rc=$?
+ok_u19=1
+[ "$rc" -ne 0 ] || { fail "U19" "expected invalid proxy URL to be rejected"; ok_u19=0; }
+[ ! -e "$conf_file" ] || { fail "U19" "invalid proxy URL must not write drop-in file"; ok_u19=0; }
+assert_contains "U19" "$out" "终端代理地址格式不合法" || ok_u19=0
+[ "$ok_u19" = "1" ] && pass "U19: 含非法字符的代理 URL 被安全拦截，不破坏 systemd drop-in"
 
 echo ""
 printf 'Summary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"

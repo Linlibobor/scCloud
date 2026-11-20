@@ -69,9 +69,11 @@ sh ./start.sh                       # 再启动 / 更新后拉镜像再起
 可选：
 
 ```bash
-sh ./start.sh --doctor     # 只读环境体检（Docker/Rootless/代理/磁盘/端口/镜像）
-sh ./start.sh --no-pull    # 不重新拉镜像，用本机已有的
-sh ./start.sh --build      # 本地构建（一般用户不需要；无需 r-engine/r-library）
+sh ./start.sh --doctor       # 只读环境体检（Docker/Rootless/代理/磁盘/端口/镜像）
+sh ./start.sh --sync-proxy   # 将终端代理同步到 Docker daemon（sccloud-proxy.conf）并重启后启动
+sh ./start.sh --clear-proxy  # 清理 sccloud-proxy.conf 并重启 Docker daemon 恢复直连
+sh ./start.sh --no-pull      # 不重新拉镜像，用本机已有的
+sh ./start.sh --build        # 本地构建（一般用户不需要；无需 r-engine/r-library）
 ```
 
 <details>
@@ -103,10 +105,12 @@ sh ./start.sh --build      # 本地构建（一般用户不需要；无需 r-eng
    输出的 `Security Options` 包含 `rootless` 即成功。  
    > **关于 `docker info` 的大量 WARNING**：出现 `No cpu cfs quota support`、`No io.weight support`、`bridge-nf-call-iptables is disabled` 等警告在 Rootless 模式下**属于正常现象，不影响 scCloud 运行**。
 4. **退出 SSH 后保持运行（可选）**：请管理员执行 `sudo loginctl enable-linger <你的用户名>`。
-5. **配置拉取镜像代理（重要）**：终端里的 `export https_proxy=...` **不会**自动传给 `systemd --user` 中的 `dockerd`。如服务器需通过代理访问 `ghcr.io` / Docker Hub，请给 Rootless `dockerd` 配 drop-in（将代理地址替换为实际值）：
+5. **配置拉取镜像代理（重要）**：终端里的 `export https_proxy=...` **不会**自动传给 `systemd --user` 中的 `dockerd`。
+   - **一键自动配置**：在已设置终端 `https_proxy` 的交互终端里运行 `sh ./start.sh`，若拉取超时，脚本会自动询问是否写入独立配置 `sccloud-proxy.conf` 并重启后重试；也可直接执行 `sh ./start.sh --sync-proxy`（若使用的是临时代理端口，事后运行 `sh ./start.sh --clear-proxy` 可一键还原直连）。
+   - **手工配置**（将代理地址替换为实际值）：
    ```bash
    mkdir -p ~/.config/systemd/user/docker.service.d
-   cat <<'EOF' > ~/.config/systemd/user/docker.service.d/http-proxy.conf
+   cat <<'EOF' > ~/.config/systemd/user/docker.service.d/sccloud-proxy.conf
    [Service]
    Environment="HTTP_PROXY=http://127.0.0.1:7890"
    Environment="HTTPS_PROXY=http://127.0.0.1:7890"

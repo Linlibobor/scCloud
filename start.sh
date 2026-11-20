@@ -3,6 +3,8 @@
 # 用法：
 #   sh ./start.sh                   # 默认：检查环境 → 拉取预构建镜像 → 启动服务
 #   sh ./start.sh --doctor          # 只读环境体检（不改 .env、不拉镜像、不启容器）
+#   sh ./start.sh --sync-proxy      # 将终端代理同步到 Docker daemon（sccloud-proxy.conf）并重启后启动
+#   sh ./start.sh --clear-proxy     # 清理 sccloud-proxy.conf 并重启 Docker daemon 恢复直连
 #   sh ./start.sh --no-pull         # 跳过 pull，仅使用本地已有镜像启动
 #   sh ./start.sh --build           # 本地源码构建（无 r-library 时自动跳过 r-engine 或拦截）
 #   sh ./start.sh --install-docker  # 缺 Docker 时自动安装（共享机勿默认使用）
@@ -38,24 +40,30 @@ CALLER_ROOTLESS="${SCCLOUD_ROOTLESS:-${SCLOUD_ROOTLESS:-}}"
 DO_BUILD=0
 DO_PULL=1
 DO_DOCTOR=0
+DO_SYNC_PROXY=0
+DO_CLEAR_PROXY=0
 INSTALL_DOCKER=0
 for arg in "$@"; do
   case "$arg" in
     --build)          DO_BUILD=1; DO_PULL=0 ;;
     --no-pull)        DO_PULL=0 ;;
     --doctor)         DO_DOCTOR=1 ;;
+    --sync-proxy)     DO_SYNC_PROXY=1 ;;
+    --clear-proxy)    DO_CLEAR_PROXY=1 ;;
     --install-docker) INSTALL_DOCKER=1 ;;
     -h|--help)
       cat <<'EOF'
-用法: sh ./start.sh [--doctor|--no-pull|--build|--install-docker]
+用法: sh ./start.sh [--doctor|--sync-proxy|--clear-proxy|--no-pull|--build|--install-docker]
   --doctor           只读环境体检（Docker/Rootless/代理/磁盘/端口/镜像），不启动服务
+  --sync-proxy       将当前终端 HTTP(S)_PROXY 写入 Docker daemon（sccloud-proxy.conf）并重启后继续启动
+  --clear-proxy      删除 sccloud-proxy.conf 并重启 Docker daemon，恢复直连
   --no-pull          不 pull，直接使用本地已有镜像
   --build            本地源码构建（缺 r-engine/r-library 时不会误构建 r-engine）
   --install-docker   未检测到 Docker 时自动运行 get.docker.com（仅限有 root 的独享主机）
 EOF
       exit 0
       ;;
-    *) echo "未知参数：$arg（支持：--doctor / --no-pull / --build / --install-docker）" >&2; exit 1 ;;
+    *) echo "未知参数：$arg（支持：--doctor / --sync-proxy / --clear-proxy / --no-pull / --build / --install-docker）" >&2; exit 1 ;;
   esac
 done
 
@@ -77,6 +85,8 @@ USE_ROOTLESS_OVERLAY=0
 COMPOSE_DISPLAY="docker compose --env-file .env"
 PULL_LOG_FILE=""
 PULL_RC_FILE=""
+PROXY_MISMATCH=0
+SHELL_PROXY_DISPLAY=""
 
 # shellcheck disable=SC2329
 cleanup_tmp() {
@@ -145,7 +155,7 @@ print_proxy_hint() {
 
 [Rootless Docker 配置代理]（终端 export https_proxy 不会传递给 systemd --user 里的 dockerd）
 mkdir -p ~/.config/systemd/user/docker.service.d
-cat <<'CONF' > ~/.config/systemd/user/docker.service.d/http-proxy.conf
+cat <<'CONF' > ~/.config/systemd/user/docker.service.d/sccloud-proxy.conf
 [Service]
 Environment="HTTP_PROXY=${sample_proxy}"
 Environment="HTTPS_PROXY=${sample_proxy}"
@@ -153,13 +163,14 @@ Environment="NO_PROXY=localhost,127.0.0.1,::1"
 CONF
 systemctl --user daemon-reload
 systemctl --user restart docker
+# 也可直接运行 sh ./start.sh --sync-proxy 自动写入；事后可用 --clear-proxy 清理
 EOF
   else
     cat >&2 <<EOF
 
 [Docker daemon 配置代理]（终端 export https_proxy 不会传递给 dockerd）
 sudo mkdir -p /etc/systemd/system/docker.service.d
-sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf >/dev/null <<'CONF'
+sudo tee /etc/systemd/system/docker.service.d/sccloud-proxy.conf >/dev/null <<'CONF'
 [Service]
 Environment="HTTP_PROXY=${sample_proxy}"
 Environment="HTTPS_PROXY=${sample_proxy}"
@@ -167,8 +178,176 @@ Environment="NO_PROXY=localhost,127.0.0.1,::1"
 CONF
 sudo systemctl daemon-reload
 sudo systemctl restart docker
+# 也可在有权限时运行 sh ./start.sh --sync-proxy 自动写入；事后可用 --clear-proxy 清理
 EOF
   fi
+}
+
+docker_proxy_dropin_path() {
+  if [ "$IS_ROOTLESS" = "1" ]; then
+    printf '%s/systemd/user/docker.service.d/sccloud-proxy.conf' "${XDG_CONFIG_HOME:-${HOME}/.config}"
+  else
+    printf '/etc/systemd/system/docker.service.d/sccloud-proxy.conf'
+  fi
+}
+
+can_manage_docker_systemd() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  if [ "$IS_ROOTLESS" = "1" ]; then
+    [ -n "${HOME:-}" ] || return 1
+    systemctl --user is-active docker >/dev/null 2>&1
+    return
+  fi
+  if [ "$(id -u)" = "0" ] || [ -n "$SUDO" ]; then
+    systemctl is-active docker >/dev/null 2>&1
+    return
+  fi
+  return 1
+}
+
+is_valid_proxy_url() {
+  u=$1
+  case "$u" in
+    http://?*|https://?*|socks5://?*|socks5h://?*) ;;
+    *) return 1 ;;
+  esac
+  if printf '%s' "$u" | grep -qE '[[:space:]"'"'"'\\;]'; then
+    return 1
+  fi
+  return 0
+}
+
+build_safe_no_proxy() {
+  raw="${NO_PROXY:-${no_proxy:-}}"
+  if [ -z "$raw" ] || printf '%s' "$raw" | grep -qE '[[:space:]"'"'"'\\;]'; then
+    printf 'localhost,127.0.0.1,::1'
+    return 0
+  fi
+  case ",${raw}," in
+    *",127.0.0.1,"*) printf '%s' "$raw" ;;
+    *) printf 'localhost,127.0.0.1,::1,%s' "$raw" ;;
+  esac
+}
+
+warn_running_containers_before_restart() {
+  running_list=$(run_docker ps --format '  - {{.Names}} ({{.Status}})' 2>/dev/null || true)
+  if [ -n "$running_list" ]; then
+    running_cnt=$(printf '%s\n' "$running_list" | wc -l | tr -d ' ')
+    warn "当前 Docker daemon 下有 ${running_cnt} 个正在运行的容器，重启 dockerd 会中断/重启这些容器："
+    printf '%s\n' "$running_list" >&2
+  fi
+}
+
+reload_and_wait_docker_systemd() {
+  if [ "$IS_ROOTLESS" = "1" ]; then
+    if ! systemctl --user daemon-reload || ! systemctl --user restart docker; then
+      return 1
+    fi
+  elif [ -n "$SUDO" ]; then
+    if ! "$SUDO" systemctl daemon-reload || ! "$SUDO" systemctl restart docker; then
+      return 1
+    fi
+  else
+    if ! systemctl daemon-reload || ! systemctl restart docker; then
+      return 1
+    fi
+  fi
+
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if run_docker info >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+apply_docker_proxy_sync() {
+  eff_http="${HTTP_PROXY:-${http_proxy:-${HTTPS_PROXY:-${https_proxy:-}}}}"
+  eff_https="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+  if [ -z "$eff_http" ] && [ -z "$eff_https" ]; then
+    warn "当前终端未设置 HTTP_PROXY / HTTPS_PROXY，无法同步代理"
+    return 1
+  fi
+  if ! is_valid_proxy_url "$eff_http" || ! is_valid_proxy_url "$eff_https"; then
+    warn "终端代理地址格式不合法（支持 http/https/socks5 且不含空白/引号），已拒绝写入：HTTP=${eff_http} HTTPS=${eff_https}"
+    return 1
+  fi
+  if ! can_manage_docker_systemd; then
+    warn "当前环境不支持通过 systemd 自动重启 Docker daemon（非 systemd 或无 root/免密 sudo），请按上方提示手工配置。"
+    return 1
+  fi
+
+  eff_no_proxy=$(build_safe_no_proxy)
+  conf_file=$(docker_proxy_dropin_path)
+  conf_dir=$(dirname -- "$conf_file")
+
+  info "写入独立代理配置：${conf_file}（不覆盖已有 http-proxy.conf）..."
+  if [ "$IS_ROOTLESS" = "1" ]; then
+    mkdir -p "$conf_dir" || return 1
+    cat > "$conf_file" <<EOF
+# 由 scCloud start.sh 生成；清理请运行：sh ./start.sh --clear-proxy
+[Service]
+Environment="HTTP_PROXY=${eff_http}"
+Environment="HTTPS_PROXY=${eff_https}"
+Environment="NO_PROXY=${eff_no_proxy}"
+EOF
+  else
+    if [ -n "$SUDO" ]; then
+      "$SUDO" mkdir -p "$conf_dir" || return 1
+      "$SUDO" tee "$conf_file" >/dev/null <<EOF
+# 由 scCloud start.sh 生成；清理请运行：sh ./start.sh --clear-proxy
+[Service]
+Environment="HTTP_PROXY=${eff_http}"
+Environment="HTTPS_PROXY=${eff_https}"
+Environment="NO_PROXY=${eff_no_proxy}"
+EOF
+    else
+      mkdir -p "$conf_dir" || return 1
+      cat > "$conf_file" <<EOF
+# 由 scCloud start.sh 生成；清理请运行：sh ./start.sh --clear-proxy
+[Service]
+Environment="HTTP_PROXY=${eff_http}"
+Environment="HTTPS_PROXY=${eff_https}"
+Environment="NO_PROXY=${eff_no_proxy}"
+EOF
+    fi
+  fi
+
+  info "重载并重启 Docker daemon..."
+  if ! reload_and_wait_docker_systemd; then
+    warn "Docker daemon 重启后未就绪，请检查 systemctl status docker 与 ${conf_file}"
+    return 1
+  fi
+
+  PROXY_MISMATCH=0
+  ok "已同步代理到 ${conf_file} 并重启 Docker daemon"
+  info "若使用的是临时代理端口，事后可运行 sh ./start.sh --clear-proxy 一键清理并恢复直连"
+  return 0
+}
+
+clear_docker_proxy_sync() {
+  detect_docker_access
+  conf_file=$(docker_proxy_dropin_path)
+  if [ ! -f "$conf_file" ]; then
+    info "未找到 ${conf_file}，无需清理"
+    exit 0
+  fi
+  if ! can_manage_docker_systemd; then
+    die "当前环境不支持自动重启 Docker daemon，请手动删除 ${conf_file} 并重启 docker"
+  fi
+  warn_running_containers_before_restart
+  if [ "$IS_ROOTLESS" = "1" ] || [ -z "$SUDO" ]; then
+    rm -f "$conf_file" || die "删除 ${conf_file} 失败"
+  else
+    "$SUDO" rm -f "$conf_file" || die "删除 ${conf_file} 失败"
+  fi
+  info "已删除 ${conf_file}，正在重载并重启 Docker daemon..."
+  reload_and_wait_docker_systemd || die "Docker daemon 重启后未就绪，请检查服务状态"
+  ok "已清理 scCloud 代理配置并恢复 Docker daemon 直连"
+  exit 0
 }
 
 ensure_docker_installed() {
@@ -439,7 +618,11 @@ check_docker_proxy() {
     info "代理状态：Shell=${shell_proxy:-未设置} | dockerd HTTP=${daemon_http:-未设置} HTTPS=${daemon_https:-未设置} | Mirrors=${daemon_mirrors:-未配置}"
   fi
 
+  PROXY_MISMATCH=0
+  SHELL_PROXY_DISPLAY="$shell_proxy"
+
   if [ -n "$shell_proxy" ] && [ -z "$daemon_http" ] && [ -z "$daemon_https" ]; then
+    PROXY_MISMATCH=1
     warn "检测到终端已设置代理（${shell_proxy}），但 Docker daemon 未配置代理！"
     warn "Docker 拉取镜像不会自动继承终端的 http_proxy/https_proxy；若直连外网受限，拉取将超时。"
     print_proxy_hint
@@ -586,6 +769,59 @@ images_ready() {
     fi
   done
   [ "$missing" = "0" ]
+}
+
+is_network_pull_error() {
+  log_file=$1
+  [ -n "$log_file" ] && [ -s "$log_file" ] || return 1
+  grep -qiE 'i/o timeout|deadline exceeded|connection refused|tls handshake|unexpected eof|no such host|temporary failure in name resolution|dial tcp' "$log_file"
+}
+
+run_pull_once() {
+  pull_ok=0
+  [ -n "$PULL_LOG_FILE" ] && rm -f "$PULL_LOG_FILE" 2>/dev/null || true
+  [ -n "$PULL_RC_FILE" ] && rm -f "$PULL_RC_FILE" 2>/dev/null || true
+  PULL_LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/sccloud-pull.XXXXXX")
+  PULL_RC_FILE=$(mktemp "${TMPDIR:-/tmp}/sccloud-pull-rc.XXXXXX")
+  pull_log="$PULL_LOG_FILE"
+  info "拉取预构建镜像（${COMPOSE_DISPLAY} pull）..."
+  (
+    run_compose pull 2>&1
+    echo $? > "$PULL_RC_FILE"
+  ) | tee "$PULL_LOG_FILE"
+  pull_rc=$(cat "$PULL_RC_FILE" 2>/dev/null || echo 1)
+  if [ "$pull_rc" = "0" ]; then
+    pull_ok=1
+  else
+    warn "镜像拉取未全部成功（退出码 ${pull_rc}），检查本地镜像与离线兜底..."
+  fi
+}
+
+offer_interactive_proxy_sync() {
+  [ "$PROXY_MISMATCH" = "1" ] || return 1
+  is_network_pull_error "$pull_log" || return 1
+  can_manage_docker_systemd || return 1
+
+  if { [ -t 0 ] && [ -t 2 ]; } || [ "${SCCLOUD_ASSUME_TTY:-0}" = "1" ]; then
+    echo "" >&2
+    warn "拉取因网络/超时失败，且终端代理（${SHELL_PROXY_DISPLAY}）尚未同步到 Docker daemon。"
+    warn_running_containers_before_restart
+    printf '是否自动将终端代理 (%s) 写入 Docker daemon（独立文件 sccloud-proxy.conf）并重启后自动重试拉取？[y/N] ' "$SHELL_PROXY_DISPLAY" >&2
+    IFS= read -r ans || ans=""
+    case "$ans" in
+      y|Y|yes|YES)
+        apply_docker_proxy_sync
+        return $?
+        ;;
+      *)
+        info "已跳过自动写入代理。"
+        return 1
+        ;;
+    esac
+  fi
+
+  info "当前为非交互终端，未自动重启 dockerd；可直接运行 sh ./start.sh --sync-proxy 自动写入并重启后拉取。"
+  return 1
 }
 
 diagnose_pull_failure() {
@@ -818,6 +1054,10 @@ run_doctor() {
 }
 
 # ---------- main ----------
+if [ "$DO_CLEAR_PROXY" = "1" ]; then
+  clear_docker_proxy_sync
+fi
+
 if [ "$DO_DOCTOR" = "1" ]; then
   run_doctor
 fi
@@ -853,6 +1093,11 @@ setup_compose_mode
 check_disk_space
 check_rootless_mounts
 check_docker_proxy
+
+if [ "$DO_SYNC_PROXY" = "1" ]; then
+  warn_running_containers_before_restart
+  apply_docker_proxy_sync || die "自动同步代理到 Docker daemon 失败"
+fi
 
 # 每次启动用 secrets 刷新 R 引擎 Redis URL（安全写入，保持 .env 600 权限）
 if [ -s ./secrets/redis-password ]; then
@@ -935,19 +1180,10 @@ else
   pull_ok=0
   pull_log=""
   if [ "$DO_PULL" = "1" ]; then
-    PULL_LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/sccloud-pull.XXXXXX")
-    PULL_RC_FILE=$(mktemp "${TMPDIR:-/tmp}/sccloud-pull-rc.XXXXXX")
-    pull_log="$PULL_LOG_FILE"
-    info "拉取预构建镜像（${COMPOSE_DISPLAY} pull）..."
-    (
-      run_compose pull 2>&1
-      echo $? > "$PULL_RC_FILE"
-    ) | tee "$PULL_LOG_FILE"
-    pull_rc=$(cat "$PULL_RC_FILE" 2>/dev/null || echo 1)
-    if [ "$pull_rc" = "0" ]; then
-      pull_ok=1
-    else
-      warn "镜像拉取未全部成功（退出码 ${pull_rc}），检查本地镜像与离线兜底..."
+    run_pull_once
+    if [ "$pull_ok" != "1" ] && offer_interactive_proxy_sync; then
+      info "代理同步完成，自动重试镜像拉取..."
+      run_pull_once
     fi
   fi
 
