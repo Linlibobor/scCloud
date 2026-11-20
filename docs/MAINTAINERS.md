@@ -103,7 +103,8 @@ docker compose --env-file .env.server -f docker-compose.server.yml up -d --build
 - DB / JWT / Redis / bootstrap 管理员密码在 **`./secrets/`**，compose secrets 挂载  
 - `R_REDIS_URL` 由向导/start 按 redis 密码生成  
 - `PROJECTS_ROOT` 默认 `/data/projects`；桥接栈多为 named volume `projects_data`  
-- `SCLOUD_ROOTLESS=1` 叠加 `docker-compose.rootless.yml`  
+- `SCCLOUD_ROOTLESS=1|0`（兼容旧名 `SCLOUD_ROOTLESS`）控制是否叠加 `docker-compose.rootless.yml`（默认在 rootless Docker 下自动叠加；监听地址统一由 `.env` 的 `WEB_BIND_ADDRESS` 控制）  
+- 基础镜像支持通过 `.env` 覆盖：`NGINX_IMAGE`、`MARIADB_IMAGE`、`REDIS_IMAGE`（默认钉 digest）  
 - 安全：`no-new-privileges`、`cap_drop`；部分服务 `read_only`；基础镜像钉 digest  
 
 ## 项目数据路径

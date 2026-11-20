@@ -4,8 +4,9 @@
 #   export COMPOSE_FILE=docker-compose.yml:docker-compose.rootless.yml
 #
 # 相对基础 compose：
-#   - 默认只绑 127.0.0.1（WEB_BIND_ADDRESS 可覆盖）
-#   - restart: always
+#   - 全部服务改为 restart: always
+#   - 监听地址统一由 .env 中的 WEB_BIND_ADDRESS 控制（仅本机/SSH 转发设 127.0.0.1，局域网设 0.0.0.0）
+#     不在此重复声明 ports，避免 Compose 列表合并产生重复端口绑定冲突。
 # secrets / read_only / cap_drop / digest pin 仍继承主文件。
 # 不在此强制清 pids_limit（compose 版本差异大；rootless 下超限通常被忽略）。
 
@@ -14,8 +15,6 @@ name: sccloud
 services:
   web:
     restart: always
-    ports:
-      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:8080"
 
   frontend:
     restart: always

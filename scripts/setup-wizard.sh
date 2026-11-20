@@ -1,16 +1,19 @@
 #!/bin/sh
-# 首次启动：生成 ./secrets/* 与 .env（密钥不进 .env 明文，对齐闲鱼助手）。
+# 首次启动：生成 ./secrets/* 与 .env（敏感密钥统一放 ./secrets/，不写入 .env 明文）。
 # 已存在的 secrets / .env 不会被覆盖。
 # 不使用 set -e；使用 set -u。
 
 set -u
 
-PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-cd "$PROJECT_DIR"
+PROJECT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$PROJECT_DIR" || exit 1
 
 SECRETS_DIR="./secrets"
 DEFAULT_ADMIN_USER="admin"
 DEFAULT_ADMIN_PASSWORD="admin123"
+
+CALLER_WEB_PORT="${WEB_PORT:-}"
+CALLER_WEB_BIND="${WEB_BIND_ADDRESS:-}"
 
 color() { printf '\033[%sm%s\033[0m' "$1" "$2"; }
 info()  { printf '%s %s\n' "$(color '1;36' '•')" "$*"; }
@@ -42,7 +45,6 @@ gen_alnum() {
 
 # compose file secrets：容器内非 root 需能读 → 0644
 ensure_secret() {
-  # $1=path $2=legacy_value $3=gen_cmd_words... we pass value already
   file=$1
   value=$2
   if [ -f "$file" ] && [ -s "$file" ]; then
@@ -103,22 +105,52 @@ R_REDIS_URL="redis://:${REDIS_PASS}@redis:6379/0"
 sync_env_key() {
   key=$1
   val=$2
-  if grep -q "^${key}=" .env 2>/dev/null; then
-    # 用 | 分隔避免 URL 中 / 问题；val 不应含 |
-    sed "s|^${key}=.*|${key}=${val}|" .env > .env.tmp && mv .env.tmp .env
-  else
-    printf '%s=%s\n' "$key" "$val" >> .env
+  (
+    umask 077
+    if grep -q "^${key}=" .env 2>/dev/null; then
+      ENV_KEY="$key" ENV_VAL="$val" awk '
+        index($0, ENVIRON["ENV_KEY"] "=") == 1 { print ENVIRON["ENV_KEY"] "=" ENVIRON["ENV_VAL"]; next }
+        { print }
+      ' .env > .env.tmp
+    else
+      cat .env > .env.tmp
+      printf '%s=%s\n' "$key" "$val" >> .env.tmp
+    fi
+    chmod 600 .env.tmp 2>/dev/null || true
+    mv .env.tmp .env
+  )
+}
+
+migrate_legacy_ghcr_env() {
+  if grep -qE '^(FRONTEND_IMAGE|BACKEND_IMAGE|R_ENGINE_IMAGE)=ghcr\.io/zyzhou-saffron/sccloud-' .env 2>/dev/null; then
+    (
+      umask 077
+      sed \
+        -e 's|^FRONTEND_IMAGE=ghcr\.io/zyzhou-saffron/sccloud-|FRONTEND_IMAGE=ghcr.io/cangiolo/sccloud-|' \
+        -e 's|^BACKEND_IMAGE=ghcr\.io/zyzhou-saffron/sccloud-|BACKEND_IMAGE=ghcr.io/cangiolo/sccloud-|' \
+        -e 's|^R_ENGINE_IMAGE=ghcr\.io/zyzhou-saffron/sccloud-|R_ENGINE_IMAGE=ghcr.io/cangiolo/sccloud-|' \
+        .env > .env.tmp
+      chmod 600 .env.tmp 2>/dev/null || true
+      mv .env.tmp .env
+    )
+    warn "检测到旧版镜像地址 ghcr.io/zyzhou-saffron/sccloud-*，已自动迁移为 ghcr.io/cangiolo/sccloud-*"
   fi
 }
 
 if [ -f .env ]; then
-  ok ".env 已存在，同步 R_REDIS_URL 并剔除明文密钥"
+  ok ".env 已存在，同步 R_REDIS_URL 并检查迁移项"
+  migrate_legacy_ghcr_env
   sync_env_key R_REDIS_URL "$R_REDIS_URL"
   if ! grep -q '^BOOTSTRAP_ADMIN_USER=' .env 2>/dev/null; then
     sync_env_key BOOTSTRAP_ADMIN_USER "$DEFAULT_ADMIN_USER"
   fi
   if grep -qE '^(DB_PASS|DB_ROOT_PASS|JWT_SECRET|BOOTSTRAP_ADMIN_PASSWORD)=' .env 2>/dev/null; then
-    grep -vE '^(DB_PASS|DB_ROOT_PASS|JWT_SECRET|BOOTSTRAP_ADMIN_PASSWORD)=' .env > .env.tmp && mv .env.tmp .env
+    (
+      umask 077
+      grep -vE '^(DB_PASS|DB_ROOT_PASS|JWT_SECRET|BOOTSTRAP_ADMIN_PASSWORD)=' .env > .env.tmp
+      chmod 600 .env.tmp 2>/dev/null || true
+      mv .env.tmp .env
+    )
     warn "已从 .env 移除明文 DB/JWT/管理员密码（改由 ./secrets/ 提供）"
   fi
   chmod 600 .env 2>/dev/null || true
@@ -126,15 +158,21 @@ else
   if [ ! -f .env.example ]; then
     die "缺少 .env.example"
   fi
-  grep -vE '^(DB_PASS|DB_ROOT_PASS|JWT_SECRET|BOOTSTRAP_ADMIN_PASSWORD)=' .env.example > .env
-  {
-    echo ""
-    echo "# ---- 由 setup-wizard 生成（密钥在 ./secrets/）----"
-    echo "BOOTSTRAP_ADMIN_USER=${DEFAULT_ADMIN_USER}"
-    echo "R_REDIS_URL=${R_REDIS_URL}"
-  } >> .env
-  chmod 600 .env 2>/dev/null || true
-  ok "已从 .env.example 创建 .env（密钥仅在 secrets/）"
+  (
+    umask 077
+    grep -vE '^(DB_PASS|DB_ROOT_PASS|JWT_SECRET|BOOTSTRAP_ADMIN_PASSWORD)=' .env.example > .env.tmp
+    {
+      echo ""
+      echo "# ---- 由 setup-wizard 生成（密钥在 ./secrets/）----"
+      echo "BOOTSTRAP_ADMIN_USER=${DEFAULT_ADMIN_USER}"
+      echo "R_REDIS_URL=${R_REDIS_URL}"
+    } >> .env.tmp
+    chmod 600 .env.tmp 2>/dev/null || true
+    mv .env.tmp .env
+  )
+  [ -n "$CALLER_WEB_PORT" ] && sync_env_key WEB_PORT "$CALLER_WEB_PORT"
+  [ -n "$CALLER_WEB_BIND" ] && sync_env_key WEB_BIND_ADDRESS "$CALLER_WEB_BIND"
+  ok "已从 .env.example 创建 .env（权限 600；密钥仅在 secrets/）"
 fi
 
 mkdir -p ./data/initdb.d ./data/projects 2>/dev/null || true
