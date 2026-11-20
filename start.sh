@@ -639,6 +639,7 @@ pick_volume_helper_image() {
 legacy_projects_volume_has_data() {
   run_docker volume inspect sccloud_projects_data >/dev/null 2>&1 || return 1
   helper_img=$(pick_volume_helper_image) || return 0
+  # shellcheck disable=SC2016
   run_docker run --rm -v "sccloud_projects_data:/src:ro" --entrypoint /bin/sh "$helper_img" \
     -c 'for e in /src/* /src/.[!.]* /src/..?*; do if [ -e "$e" ] || [ -L "$e" ]; then exit 0; fi; done; exit 1' \
     >/dev/null 2>&1
