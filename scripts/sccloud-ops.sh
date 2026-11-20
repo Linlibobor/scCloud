@@ -200,12 +200,14 @@ case "$cmd" in
     }
     ensure_projects_data_dir
     echo "正在将旧 Docker 命名卷 sccloud_projects_data 无损复制到 ${target}（使用镜像 ${helper_img}）..."
+    # 仅逐项复制 /src 子条目（避免 cp -a /src/. 覆盖宿主机 /dst 根目录属主与权限）
+    # shellcheck disable=SC2016
     run_docker run --rm --user 0:0 \
       -v "sccloud_projects_data:/src:ro" \
       -v "${target}:/dst" \
       --entrypoint /bin/sh \
       "$helper_img" \
-      -c 'cp -a /src/. /dst/' || {
+      -c 'for e in /src/* /src/.[!.]* /src/..?*; do if [ -e "$e" ] || [ -L "$e" ]; then cp -a "$e" /dst/ || exit 1; fi; done; chmod 0777 /dst 2>/dev/null || true' || {
       echo "卷数据迁移失败，请检查目标目录权限与磁盘空间。" >&2
       exit 1
     }
