@@ -1,0 +1,75 @@
+name: Deploy Scripts Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "start.sh"
+      - "scripts/setup-wizard.sh"
+      - "scripts/sccloud-ops.sh"
+      - "docker-compose*.yml"
+      - ".env.example"
+      - "tests/test_start_sh.sh"
+      - ".github/workflows/deploy-scripts-test.yml"
+  pull_request:
+    paths:
+      - "start.sh"
+      - "scripts/setup-wizard.sh"
+      - "scripts/sccloud-ops.sh"
+      - "docker-compose*.yml"
+      - ".env.example"
+      - "tests/test_start_sh.sh"
+      - ".github/workflows/deploy-scripts-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check (dash & bash)
+        run: |
+          dash -n start.sh scripts/setup-wizard.sh scripts/sccloud-ops.sh tests/test_start_sh.sh
+          bash -n start.sh scripts/setup-wizard.sh scripts/sccloud-ops.sh tests/test_start_sh.sh
+
+      - name: ShellCheck
+        run: |
+          shellcheck -s sh start.sh scripts/setup-wizard.sh scripts/sccloud-ops.sh tests/test_start_sh.sh
+
+      - name: Unit tests under dash
+        run: dash ./tests/test_start_sh.sh
+
+      - name: Unit tests under bash
+        run: bash ./tests/test_start_sh.sh
+
+      - name: Validate Docker Compose rendering matrix
+        run: |
+          set -eu
+          docker compose --env-file .env.example config >/dev/null
+
+          # Rootless overlay with .env.example: exactly 1 published port mapping on web
+          cnt_with_env=$(
+            docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.rootless.yml config \
+              | awk '/^  web:/ { in_web=1; next } in_web && (/^  [a-z]/ || /^[^ ]/) { exit } in_web { print }' | grep -c 'published:'
+          )
+          test "$cnt_with_env" -eq 1
+
+          # Rootless overlay without WEB_BIND_ADDRESS: still exactly 1 published port mapping (no merge conflict)
+          cnt_no_env=$(
+            env -u WEB_BIND_ADDRESS docker compose --env-file /dev/null -f docker-compose.yml -f docker-compose.rootless.yml config \
+              | awk '/^  web:/ { in_web=1; next } in_web && (/^  [a-z]/ || /^[^ ]/) { exit } in_web { print }' | grep -c 'published:'
+          )
+          test "$cnt_no_env" -eq 1
+
+          # Base image overrides via env vars
+          NGINX_IMAGE=example.com/nginx:1 MARIADB_IMAGE=example.com/mariadb:11 REDIS_IMAGE=example.com/redis:7 \
+            docker compose --env-file .env.example config | grep -q 'image: example.com/nginx:1'
+          NGINX_IMAGE=example.com/nginx:1 MARIADB_IMAGE=example.com/mariadb:11 REDIS_IMAGE=example.com/redis:7 \
+            docker compose --env-file .env.example config | grep -q 'image: example.com/mariadb:11'
+          NGINX_IMAGE=example.com/nginx:1 MARIADB_IMAGE=example.com/mariadb:11 REDIS_IMAGE=example.com/redis:7 \
+            docker compose --env-file .env.example config | grep -q 'image: example.com/redis:7'

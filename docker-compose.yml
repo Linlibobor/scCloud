@@ -1,4 +1,4 @@
-# scCloud — 一键部署（桥接网络，对齐闲鱼助手：secrets + 加固）
+# scCloud — 一键部署（桥接网络：secrets + 安全加固）
 #
 # 用法:
 #   sh ./start.sh
@@ -28,7 +28,7 @@ services:
   # ---- 唯一对外入口 ----
   web:
     <<: *service-defaults
-    image: nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913
+    image: ${NGINX_IMAGE:-nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913}
     user: nginx
     read_only: true
     cap_drop:
@@ -213,7 +213,7 @@ services:
   db:
     <<: *service-defaults
     # 钉 digest，避免 latest 漂移（与 GPU 上 mariadb:11 对齐，2026-09）
-    image: mariadb:11@sha256:2439dcd7d14010ecd1ff7a4e1c5abe8e208c34fe35290744deeeaac3569043c3
+    image: ${MARIADB_IMAGE:-mariadb:11@sha256:2439dcd7d14010ecd1ff7a4e1c5abe8e208c34fe35290744deeeaac3569043c3}
     user: mysql
     read_only: true
     cap_drop:
@@ -246,7 +246,7 @@ services:
 
   redis:
     <<: *service-defaults
-    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    image: ${REDIS_IMAGE:-redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf}
     user: redis
     read_only: true
     cap_drop:

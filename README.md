@@ -18,8 +18,8 @@
 - 一台 **Linux x86_64（amd64）** 机器（当前预构建计算镜像仅支持 amd64）
 - [Docker](https://docs.docker.com/get-docker/) ≥ 24，带 **Compose v2**（`docker compose version` 有输出）
 - 内存建议 ≥ 16 GB（大数据集 32 GB+）
-- 磁盘预留几十 GB（镜像 + 你的项目数据）
-- 能访问 GitHub 容器仓库（`ghcr.io`），用于拉取镜像
+- 磁盘预留 ≥ 20 GB（全部镜像解压约 8 GB，另需拉取缓冲与项目数据）
+- 能访问 GitHub 容器仓库（`ghcr.io`）与 Docker Hub（`nginx`/`mariadb`/`redis`），受限网络需给 Docker daemon 配置代理或镜像源
 
 ## 一键启动
 
@@ -69,9 +69,59 @@ sh ./start.sh                       # 再启动 / 更新后拉镜像再起
 可选：
 
 ```bash
+sh ./start.sh --doctor     # 只读环境体检（Docker/Rootless/代理/磁盘/端口/镜像）
 sh ./start.sh --no-pull    # 不重新拉镜像，用本机已有的
-sh ./start.sh --build      # 强制本地构建（一般用户不需要）
+sh ./start.sh --build      # 本地构建（一般用户不需要；无需 r-engine/r-library）
 ```
+
+<details>
+<summary>共享 Linux 服务器（无 root / Rootless Docker）与代理配置</summary>
+
+共享科研服务器上不建议把普通账号加入 `docker` 组（等同于整机 root 权限），推荐在自己账号下安装 **Rootless Docker**：
+
+1. **检查前置条件**（两个命令需存在，两个文件里都应有当前用户记录且分配数量 ≥ 65536；缺失请联系管理员分配）：
+   ```bash
+   command -v newuidmap newgidmap
+   grep "^$(whoami):" /etc/subuid /etc/subgid
+   ```
+2. **安装个人 Rootless Docker**：
+   ```bash
+   # 系统已带安装工具时直接运行（若系统 Docker 正在运行，加 --force，不要停系统服务）
+   dockerd-rootless-setuptool.sh install
+
+   # 若系统找不到 dockerd-rootless-setuptool.sh，可用官方脚本安装到 ~/bin
+   # curl -fsSL https://get.docker.com/rootless -o /tmp/docker-rootless-install.sh
+   # sh /tmp/docker-rootless-install.sh
+   # export PATH="$HOME/bin:$PATH"
+   ```
+3. **启动并验证**：
+   ```bash
+   systemctl --user enable --now docker
+   docker context use rootless
+   docker info
+   ```
+   输出的 `Security Options` 包含 `rootless` 即成功。  
+   > **关于 `docker info` 的大量 WARNING**：出现 `No cpu cfs quota support`、`No io.weight support`、`bridge-nf-call-iptables is disabled` 等警告在 Rootless 模式下**属于正常现象，不影响 scCloud 运行**。
+4. **退出 SSH 后保持运行（可选）**：请管理员执行 `sudo loginctl enable-linger <你的用户名>`。
+5. **配置拉取镜像代理（重要）**：终端里的 `export https_proxy=...` **不会**自动传给 `systemd --user` 中的 `dockerd`。如服务器需通过代理访问 `ghcr.io` / Docker Hub，请给 Rootless `dockerd` 配 drop-in（将代理地址替换为实际值）：
+   ```bash
+   mkdir -p ~/.config/systemd/user/docker.service.d
+   cat <<'EOF' > ~/.config/systemd/user/docker.service.d/http-proxy.conf
+   [Service]
+   Environment="HTTP_PROXY=http://127.0.0.1:7890"
+   Environment="HTTPS_PROXY=http://127.0.0.1:7890"
+   Environment="NO_PROXY=localhost,127.0.0.1,::1"
+   EOF
+   systemctl --user daemon-reload
+   systemctl --user restart docker
+   ```
+6. **部署前体检与启动**：
+   ```bash
+   sh ./start.sh --doctor   # 确认 rootless、代理、磁盘与端口均正常
+   sh ./start.sh            # 端口若与他人冲突会自动顺延，或在 .env 中指定 WEB_PORT
+   ```
+
+</details>
 
 ## 使用方式
 
@@ -111,8 +161,11 @@ sh ./start.sh --build      # 强制本地构建（一般用户不需要）
 **打不开页面**  
 先看 `sh ./scripts/sccloud-ops.sh status` 是否都是 healthy / running，再访问 `/healthz`。日志：`sh ./scripts/sccloud-ops.sh logs`。
 
-**拉取镜像失败**  
-检查能否访问 `ghcr.io`。公司网络需代理时，给 Docker 配好代理后重试 `sh ./start.sh`。
+**拉取镜像失败 / 超时 / 提示缺少 `r-library`**  
+- 先跑 `sh ./start.sh --doctor` 检查 Docker 代理、网络连通性和 `.env` 镜像地址。  
+- 终端设置了 `https_proxy` 但拉镜像仍超时，说明代理没配进 Docker daemon（见上方「Rootless Docker 与代理配置」）。  
+- 普通用户**不需要 `r-engine/r-library` 目录**，直接拉取预构建镜像即可；离线环境可从 [Release](https://github.com/WeiLabCPU/scCloud/releases) 下载 `sccloud-r-engine-image.tar.gz` 放入 `./data/` 后重跑 `sh ./start.sh`。  
+- 旧版本已生成过 `.env`（含原 `ghcr.io/zyzhou-saffron/` 地址）的用户，`git pull` 后直接执行 `sh ./start.sh` 会自动迁移到 `ghcr.io/cangiolo/`。
 
 **分析一直失败 / 内存不足**  
 大数据集需要更大内存；可在 `.env` 中调整 `R_ENGINE_MEM_LIMIT`、`R_WORKER_MEM_LIMIT`（默认约 16g / 32g）后重启。

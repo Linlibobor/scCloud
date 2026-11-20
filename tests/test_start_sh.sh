@@ -1,0 +1,606 @@
+#!/bin/sh
+# scCloud 一键部署脚本自动化测试（POSIX sh，零外部依赖，兼容 dash / bash）
+# 用法：sh ./tests/test_start_sh.sh
+
+set -u
+
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/sccloud-start-tests.XXXXXX")
+SOCK_DIR=""
+cleanup_tests() {
+  rm -rf "$TMP_BASE"
+  [ -n "$SOCK_DIR" ] && rm -rf "$SOCK_DIR"
+}
+trap cleanup_tests EXIT
+
+PASS_COUNT=0
+FAIL_COUNT=0
+
+pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
+  printf '  [PASS] %s\n' "$1"
+}
+
+fail() {
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  printf '  [FAIL] %s: %s\n' "$1" "$2" >&2
+}
+
+assert_contains() {
+  name=$1
+  haystack=$2
+  needle=$3
+  if printf '%s\n' "$haystack" | grep -Fq -- "$needle"; then
+    return 0
+  fi
+  fail "$name" "expected output to contain: $needle"
+  printf '    --- actual output ---\n%s\n    ---------------------\n' "$haystack" >&2
+  return 1
+}
+
+assert_not_contains() {
+  name=$1
+  haystack=$2
+  needle=$3
+  if printf '%s\n' "$haystack" | grep -Fq -- "$needle"; then
+    fail "$name" "expected output NOT to contain: $needle"
+    printf '    --- actual output ---\n%s\n    ---------------------\n' "$haystack" >&2
+    return 1
+  fi
+  return 0
+}
+
+# 创建隔离测试沙盒（模拟外部用户干净 git clone：无 r-engine/r-library）
+setup_sandbox() {
+  case_id=$1
+  sb="${TMP_BASE}/${case_id}"
+  mkdir -p "$sb/scripts" "$sb/nginx" "$sb/r-engine/R" "$sb/r-engine/data" "$sb/fake-bin"
+  cp "$REPO_ROOT/start.sh" "$sb/start.sh"
+  cp "$REPO_ROOT/scripts/setup-wizard.sh" "$sb/scripts/setup-wizard.sh"
+  cp "$REPO_ROOT/scripts/sccloud-ops.sh" "$sb/scripts/sccloud-ops.sh"
+  cp "$REPO_ROOT/.env.example" "$sb/.env.example"
+  cp "$REPO_ROOT/docker-compose.yml" "$sb/docker-compose.yml"
+  cp "$REPO_ROOT/docker-compose.rootless.yml" "$sb/docker-compose.rootless.yml"
+  chmod +x "$sb/start.sh" "$sb/scripts/setup-wizard.sh" "$sb/scripts/sccloud-ops.sh"
+  printf 'server {}\n' > "$sb/nginx/nginx.bridge.conf"
+  printf '# stub\n' > "$sb/r-engine/plumber.R"
+  printf '# stub\n' > "$sb/r-engine/worker.R"
+  printf '# stub\n' > "$sb/r-engine/run_job.R"
+  chmod -R a+rX "$sb/nginx" "$sb/r-engine"
+
+  # ---- mock docker ----
+  cat > "$sb/fake-bin/docker" <<'EOF'
+#!/bin/sh
+set -u
+[ -n "${MOCK_DOCKER_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+
+if [ "${1:-}" = "compose" ] && [ "${2:-}" = "version" ]; then
+  echo "Docker Compose version v2.29.0"
+  exit 0
+fi
+
+if [ "${1:-}" = "version" ]; then
+  echo "27.2.0"
+  exit 0
+fi
+
+if [ "${1:-}" = "info" ]; then
+  if [ -n "${MOCK_DOCKER_REQUIRE_HOST:-}" ] && [ "${DOCKER_HOST:-}" != "$MOCK_DOCKER_REQUIRE_HOST" ]; then
+    echo "Cannot connect to the Docker daemon" >&2
+    exit 1
+  fi
+  if [ "${MOCK_DOCKER_INFO_FAIL:-0}" = "1" ]; then
+    echo "permission denied while trying to connect to the Docker daemon socket" >&2
+    exit 1
+  fi
+  fmt=""
+  shift
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--format" ]; then
+      fmt="${2:-}"
+      shift 2
+    else
+      shift
+    fi
+  done
+  case "$fmt" in
+    *"SecurityOptions"*)
+      if [ "${MOCK_DOCKER_ROOTLESS:-0}" = "1" ]; then
+        echo "[name=seccomp,profile=builtin name=rootless name=cgroupns]"
+      else
+        echo "[name=seccomp,profile=builtin]"
+      fi
+      ;;
+    *"DockerRootDir"*)
+      echo "${MOCK_DOCKER_ROOT_DIR:-/var/lib/docker}"
+      ;;
+    *"HTTPProxy"*)
+      printf '%s|%s\n' "${MOCK_DOCKER_HTTP_PROXY:-}" "${MOCK_DOCKER_HTTPS_PROXY:-}"
+      ;;
+    *"Mirrors"*)
+      echo "${MOCK_DOCKER_MIRRORS:-[]}"
+      ;;
+    *)
+      echo "Server Version: 27.2.0"
+      ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+  ref="${3:-}"
+  if [ "${MOCK_ALL_LOCAL_IMAGES:-0}" = "1" ]; then
+    exit 0
+  fi
+  case " ${MOCK_LOCAL_IMAGES:-} " in
+    *" ${ref} "*) exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+
+if [ "${1:-}" = "tag" ]; then
+  exit 0
+fi
+
+if [ "${1:-}" = "compose" ]; then
+  shift
+  # 跳过 --env-file / -f / -p 等前置参数
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --env-file|-f|-p) shift 2 ;;
+      -*) shift ;;
+      *) break ;;
+    esac
+  done
+  subcmd="${1:-}"
+  [ "$#" -gt 0 ] && shift
+  case "$subcmd" in
+    port)
+      if [ -n "${MOCK_OWN_PORT:-}" ]; then
+        echo "0.0.0.0:${MOCK_OWN_PORT}"
+        exit 0
+      fi
+      exit 1
+      ;;
+    pull)
+      [ -n "${MOCK_PULL_MSG:-}" ] && printf '%s\n' "$MOCK_PULL_MSG" >&2
+      exit "${MOCK_PULL_RC:-0}"
+      ;;
+    build)
+      exit "${MOCK_BUILD_RC:-0}"
+      ;;
+    up)
+      exit "${MOCK_UP_RC:-0}"
+      ;;
+    ps)
+      case "$*" in
+        *"Health"*) echo "healthy" ;;
+        *"Status"*) echo "Up 5 seconds (healthy)" ;;
+        *) echo "sccloud-web-1 Up 5 seconds (healthy)" ;;
+      esac
+      exit 0
+      ;;
+    exec)
+      exit 0
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+fi
+
+exit 0
+EOF
+
+  # ---- mock sudo ----
+  cat > "$sb/fake-bin/sudo" <<'EOF'
+#!/bin/sh
+set -u
+[ -n "${MOCK_SUDO_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_SUDO_LOG"
+if [ "${1:-}" != "-n" ]; then
+  echo "ERROR: interactive sudo invoked without -n!" >&2
+  exit 99
+fi
+exit "${MOCK_SUDO_RC:-1}"
+EOF
+
+  # ---- mock ss ----
+  cat > "$sb/fake-bin/ss" <<'EOF'
+#!/bin/sh
+set -u
+echo "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port"
+for p in ${MOCK_LISTEN_PORTS:-}; do
+  printf 'LISTEN 0      4096   0.0.0.0:%s       0.0.0.0:*\n' "$p"
+done
+EOF
+
+  # ---- mock df ----
+  cat > "$sb/fake-bin/df" <<'EOF'
+#!/bin/sh
+set -u
+target="."
+for a in "$@"; do
+  target="$a"
+done
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+if [ -n "${MOCK_DOCKER_ROOT_DIR:-}" ] && [ "$target" = "$MOCK_DOCKER_ROOT_DIR" ]; then
+  printf '%s 104857600 52428800 %s 50%% %s\n' "${MOCK_DF_DOCKER_FS:-/dev/docker}" "${MOCK_DF_DOCKER_KB:-52428800}" "$target"
+else
+  printf '%s 104857600 52428800 %s 50%% %s\n' "${MOCK_DF_PROJ_FS:-/dev/proj}" "${MOCK_DF_PROJ_KB:-52428800}" "$target"
+fi
+EOF
+
+  # ---- mock uname ----
+  cat > "$sb/fake-bin/uname" <<'EOF'
+#!/bin/sh
+set -u
+if [ "${1:-}" = "-m" ]; then
+  echo "${MOCK_UNAME_M:-x86_64}"
+  exit 0
+fi
+/usr/bin/uname "$@" 2>/dev/null || echo "Linux"
+EOF
+
+  # ---- mock curl ----
+  cat > "$sb/fake-bin/curl" <<'EOF'
+#!/bin/sh
+set -u
+url=""
+write_code=0
+for a in "$@"; do
+  case "$a" in
+    http://*|https://*) url="$a" ;;
+    "%{http_code}") write_code=1 ;;
+  esac
+done
+if [ "$write_code" = "1" ]; then
+  case "$url" in
+    *ghcr.io*) echo "${MOCK_CURL_GHCR_CODE:-401}" ;;
+    *docker.io*) echo "${MOCK_CURL_HUB_CODE:-401}" ;;
+    *) echo "200" ;;
+  esac
+  exit 0
+fi
+case "$url" in
+  */healthz)
+    exit "${MOCK_HEALTHZ_RC:-0}"
+    ;;
+esac
+exit 0
+EOF
+
+  chmod +x "$sb/fake-bin/"*
+  printf '%s' "$sb"
+}
+
+ALL_SIX_IMAGES="ghcr.io/cangiolo/sccloud-frontend:latest ghcr.io/cangiolo/sccloud-backend:latest ghcr.io/cangiolo/sccloud-r-engine:latest nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913 mariadb:11@sha256:2439dcd7d14010ecd1ff7a4e1c5abe8e208c34fe35290744deeeaac3569043c3 redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf"
+
+echo "Running scCloud start.sh / sccloud-ops.sh unit tests..."
+
+# ---------------- U1: 无 Docker 访问权限（共享机） ----------------
+sb=$(setup_sandbox u1)
+sudo_log="$sb/sudo.log"
+out=$(
+  cd "$sb" && \
+  env -u DOCKER_HOST -u XDG_RUNTIME_DIR \
+    PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_INFO_FAIL=1 MOCK_SUDO_RC=1 MOCK_SUDO_LOG="$sudo_log" \
+    sh ./start.sh 2>&1
+)
+rc=$?
+ok_u1=1
+[ "$rc" -ne 0 ] || { fail "U1" "expected non-zero exit"; ok_u1=0; }
+assert_contains "U1" "$out" "dockerd-rootless-setuptool.sh" || ok_u1=0
+assert_not_contains "U1" "$out" "interactive sudo invoked without -n" || ok_u1=0
+if [ -f "$sudo_log" ] && grep -vq '^-n ' "$sudo_log"; then
+  fail "U1" "sudo was invoked without -n"
+  ok_u1=0
+fi
+[ "$ok_u1" = "1" ] && pass "U1: 无 Docker 权限时不阻塞 sudo，输出 Rootless 引导"
+
+# ---------------- U2: Rootless socket 自动发现 ----------------
+if command -v python3 >/dev/null 2>&1; then
+  sb=$(setup_sandbox u2)
+  # AF_UNIX 路径最长 108 字节，使用短 /tmp 目录避免超长 TMPDIR 报错
+  SOCK_DIR=$(mktemp -d "/tmp/sc-sock.XXXXXX")
+  sock_path="${SOCK_DIR}/docker.sock"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$sock_path"
+  out=$(
+    cd "$sb" && \
+    env -u DOCKER_HOST \
+      PATH="$sb/fake-bin:$PATH" HOME="$sb/home" XDG_RUNTIME_DIR="$SOCK_DIR" \
+      MOCK_DOCKER_REQUIRE_HOST="unix://${sock_path}" MOCK_DOCKER_ROOTLESS=1 \
+      MOCK_ALL_LOCAL_IMAGES=1 \
+      sh ./start.sh --doctor 2>&1
+  )
+  rc=$?
+  ok_u2=1
+  [ "$rc" -eq 0 ] || { fail "U2" "expected exit 0, got $rc"; ok_u2=0; }
+  assert_contains "U2" "$out" "自动检测到 rootless Docker socket" || ok_u2=0
+  assert_contains "U2" "$out" "模式=rootless" || ok_u2=0
+  [ "$ok_u2" = "1" ] && pass "U2: 自动发现 rootless docker.sock 并识别 rootless 模式"
+else
+  pass "U2: (skipped - python3 not available to create UNIX socket)"
+fi
+
+# ---------------- U3: Shell 有代理但 dockerd 无代理 ----------------
+sb=$(setup_sandbox u3)
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    HTTPS_PROXY="http://127.0.0.1:7890" \
+    MOCK_DOCKER_ROOTLESS=1 MOCK_DOCKER_HTTP_PROXY="" MOCK_DOCKER_HTTPS_PROXY="" \
+    MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --doctor 2>&1
+)
+rc=$?
+ok_u3=1
+[ "$rc" -eq 0 ] || { fail "U3" "expected exit 0, got $rc"; ok_u3=0; }
+assert_contains "U3" "$out" "Docker daemon 未配置代理" || ok_u3=0
+assert_contains "U3" "$out" "~/.config/systemd/user/docker.service.d/http-proxy.conf" || ok_u3=0
+[ "$ok_u3" = "1" ] && pass "U3: 识别 Shell 与 rootless dockerd 代理错位并输出 drop-in 配置"
+
+# ---------------- U4: pull 超时不回退 build ----------------
+sb=$(setup_sandbox u4)
+dlog="$sb/docker.log"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_LOG="$dlog" MOCK_DOCKER_ROOTLESS=1 \
+    MOCK_PULL_RC=1 MOCK_PULL_MSG='Head "https://registry-1.docker.io/v2/": dial tcp 1.2.3.4:443: i/o timeout' \
+    MOCK_LOCAL_IMAGES="" \
+    sh ./start.sh 2>&1
+)
+rc=$?
+ok_u4=1
+[ "$rc" -ne 0 ] || { fail "U4" "expected non-zero exit"; ok_u4=0; }
+assert_contains "U4" "$out" "超时或网络不可达" || ok_u4=0
+assert_contains "U4" "$out" "无需 r-engine/r-library" || ok_u4=0
+if grep -Eq '^compose .* build' "$dlog" 2>/dev/null; then
+  fail "U4" "docker compose build was unexpectedly called after pull timeout"
+  ok_u4=0
+fi
+[ "$ok_u4" = "1" ] && pass "U4: pull 超时绝不回退 docker compose build，精准指出代理/网络原因"
+
+# ---------------- U5: pull DENIED 不回退 build ----------------
+sb=$(setup_sandbox u5)
+dlog="$sb/docker.log"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_LOG="$dlog" \
+    MOCK_PULL_RC=1 MOCK_PULL_MSG='Error response from daemon: Head "https://ghcr.io/v2/...": denied: requested access to the resource is denied' \
+    MOCK_LOCAL_IMAGES="" \
+    sh ./start.sh 2>&1
+)
+rc=$?
+ok_u5=1
+[ "$rc" -ne 0 ] || { fail "U5" "expected non-zero exit"; ok_u5=0; }
+assert_contains "U5" "$out" "拒绝访问或 tag 不存在" || ok_u5=0
+if grep -Eq '^compose .* build' "$dlog" 2>/dev/null; then
+  fail "U5" "docker compose build was unexpectedly called after pull DENIED"
+  ok_u5=0
+fi
+[ "$ok_u5" = "1" ] && pass "U5: pull 遇 DENIED 绝不回退 build，提示检查镜像命名空间或登录"
+
+# ---------------- U6: pull 失败但本地 6 镜像均就绪 ----------------
+sb=$(setup_sandbox u6)
+dlog="$sb/docker.log"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_LOG="$dlog" \
+    MOCK_PULL_RC=1 MOCK_PULL_MSG='temporary network error' \
+    MOCK_LOCAL_IMAGES="$ALL_SIX_IMAGES" \
+    sh ./start.sh 2>&1
+)
+rc=$?
+ok_u6=1
+[ "$rc" -eq 0 ] || { fail "U6" "expected exit 0, got $rc"; ok_u6=0; }
+assert_contains "U6" "$out" "本地已具备全部 6 个镜像" || ok_u6=0
+if grep -Eq '^compose .* build' "$dlog" 2>/dev/null; then
+  fail "U6" "build should not run when all 6 local images exist"
+  ok_u6=0
+fi
+[ "$ok_u6" = "1" ] && pass "U6: pull 失败但本地 6 镜像全齐时平滑回退本地缓存启动"
+
+# ---------------- U7: 无 r-library 传 --build（且无本地 R 镜像） ----------------
+sb=$(setup_sandbox u7)
+dlog="$sb/docker.log"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_LOG="$dlog" MOCK_LOCAL_IMAGES="" \
+    sh ./start.sh --build 2>&1
+)
+rc=$?
+ok_u7=1
+[ "$rc" -ne 0 ] || { fail "U7" "expected non-zero exit"; ok_u7=0; }
+assert_contains "U7" "$out" "已拦截 --build" || ok_u7=0
+assert_contains "U7" "$out" "不含 r-engine/r-library" || ok_u7=0
+if grep -Eq '^compose .* build' "$dlog" 2>/dev/null; then
+  fail "U7" "build should be blocked before invoking docker compose build"
+  ok_u7=0
+fi
+[ "$ok_u7" = "1" ] && pass "U7: 无 r-library 且无本地 R 镜像时，--build 在调用 BuildKit 前被拦截"
+
+# ---------------- U8: 无 r-library 传 --build（但本地已有 R 镜像） ----------------
+sb=$(setup_sandbox u8)
+dlog="$sb/docker.log"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_LOG="$dlog" \
+    MOCK_LOCAL_IMAGES="ghcr.io/cangiolo/sccloud-r-engine:latest" \
+    sh ./start.sh --build 2>&1
+)
+rc=$?
+ok_u8=1
+[ "$rc" -eq 0 ] || { fail "U8" "expected exit 0, got $rc"; ok_u8=0; }
+if ! grep -Eq '^compose .* build frontend backend$' "$dlog" 2>/dev/null; then
+  fail "U8" "expected docker compose build frontend backend only"
+  cat "$dlog" >&2
+  ok_u8=0
+fi
+[ "$ok_u8" = "1" ] && pass "U8: 无 r-library 但已有本地 R 镜像时，--build 仅构建 frontend 与 backend"
+
+# ---------------- U9: 旧 .env 自动迁移 + 600 权限保持 ----------------
+sb=$(setup_sandbox u9)
+cat > "$sb/.env" <<'EOF'
+WEB_PORT=8091
+WEB_BIND_ADDRESS=127.0.0.1
+FRONTEND_IMAGE=ghcr.io/zyzhou-saffron/sccloud-frontend:latest
+BACKEND_IMAGE=ghcr.io/zyzhou-saffron/sccloud-backend:latest
+R_ENGINE_IMAGE=ghcr.io/zyzhou-saffron/sccloud-r-engine:latest
+EOF
+chmod 600 "$sb/.env"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --no-pull 2>&1
+)
+rc=$?
+ok_u9=1
+[ "$rc" -eq 0 ] || { fail "U9" "expected exit 0, got $rc"; ok_u9=0; }
+grep -q '^FRONTEND_IMAGE=ghcr.io/cangiolo/sccloud-frontend:latest$' "$sb/.env" || { fail "U9" "FRONTEND_IMAGE not migrated"; ok_u9=0; }
+grep -q '^BACKEND_IMAGE=ghcr.io/cangiolo/sccloud-backend:latest$' "$sb/.env" || { fail "U9" "BACKEND_IMAGE not migrated"; ok_u9=0; }
+grep -q '^R_ENGINE_IMAGE=ghcr.io/cangiolo/sccloud-r-engine:latest$' "$sb/.env" || { fail "U9" "R_ENGINE_IMAGE not migrated"; ok_u9=0; }
+env_perm=$(ls -l "$sb/.env" | awk '{print $1}')
+case "$env_perm" in
+  -rw-------*) ;;
+  *) fail "U9" ".env perm degraded to $env_perm"; ok_u9=0 ;;
+esac
+assert_not_contains "U9" "$out" "当前绑定 0.0.0.0" || ok_u9=0
+[ "$ok_u9" = "1" ] && pass "U9: 旧 .env 自动迁移为 ghcr.io/cangiolo/* 且保持 600 权限"
+
+# ---------------- U10: 二次运行不漂移自家占用端口 ----------------
+sb=$(setup_sandbox u10)
+cat > "$sb/.env" <<'EOF'
+WEB_PORT=8091
+WEB_BIND_ADDRESS=0.0.0.0
+EOF
+chmod 600 "$sb/.env"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_LISTEN_PORTS="8091" MOCK_OWN_PORT="8091" MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --no-pull 2>&1
+)
+rc=$?
+ok_u10=1
+[ "$rc" -eq 0 ] || { fail "U10" "expected exit 0, got $rc"; ok_u10=0; }
+assert_contains "U10" "$out" "正由当前 scCloud 服务使用，保持不变" || ok_u10=0
+grep -q '^WEB_PORT=8091$' "$sb/.env" || { fail "U10" "WEB_PORT drifted!"; ok_u10=0; }
+[ "$ok_u10" = "1" ] && pass "U10: 端口被自家 web 容器占用时不发生 WEB_PORT 漂移"
+
+# ---------------- U11: 外部进程占端口时自动顺延并保 600 权限 ----------------
+sb=$(setup_sandbox u11)
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_LISTEN_PORTS="8080" MOCK_OWN_PORT="" MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --no-pull 2>&1
+)
+rc=$?
+ok_u11=1
+[ "$rc" -eq 0 ] || { fail "U11" "expected exit 0, got $rc"; ok_u11=0; }
+grep -q '^WEB_PORT=8081$' "$sb/.env" || { fail "U11" "expected WEB_PORT=8081"; ok_u11=0; }
+env_perm=$(ls -l "$sb/.env" | awk '{print $1}')
+case "$env_perm" in
+  -rw-------*) ;;
+  *) fail "U11" ".env perm degraded to $env_perm"; ok_u11=0 ;;
+esac
+[ "$ok_u11" = "1" ] && pass "U11: 端口被外部占用时顺延到 8081 且 .env 权限保持 600"
+
+# ---------------- U12: 非 amd64 架构与 DockerRootDir 磁盘不足告警 ----------------
+sb=$(setup_sandbox u12)
+mkdir -p "$sb/docker-data"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_UNAME_M="aarch64" \
+    MOCK_DOCKER_ROOT_DIR="$sb/docker-data" \
+    MOCK_DF_PROJ_KB=52428800 MOCK_DF_DOCKER_KB=5242880 \
+    MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --doctor 2>&1
+)
+rc=$?
+ok_u12=1
+[ "$rc" -eq 0 ] || { fail "U12" "expected exit 0, got $rc"; ok_u12=0; }
+assert_contains "U12" "$out" "非 amd64 架构（aarch64）" || ok_u12=0
+assert_contains "U12" "$out" "Docker 数据目录" || ok_u12=0
+assert_contains "U12" "$out" "约 5GB" || ok_u12=0
+[ "$ok_u12" = "1" ] && pass "U12: 提前告警非 amd64 架构与 DockerRootDir 空间不足"
+
+# ---------------- U13: --doctor 只读不改任何文件、不 pull/build/up ----------------
+sb=$(setup_sandbox u13)
+dlog="$sb/docker.log"
+out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_LOG="$dlog" MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --doctor 2>&1
+)
+rc=$?
+ok_u13=1
+[ "$rc" -eq 0 ] || { fail "U13" "expected exit 0, got $rc"; ok_u13=0; }
+[ ! -e "$sb/.env" ] || { fail "U13" "--doctor must not create .env"; ok_u13=0; }
+[ ! -e "$sb/secrets" ] || { fail "U13" "--doctor must not create secrets/"; ok_u13=0; }
+if grep -Eq '^compose .* (pull|build|up)' "$dlog" 2>/dev/null; then
+  fail "U13" "--doctor must not call pull/build/up"
+  ok_u13=0
+fi
+[ "$ok_u13" = "1" ] && pass "U13: --doctor 严格只读（不创建 .env/secrets，不执行 pull/build/up）"
+
+# ---------------- U14: sccloud-ops.sh Rootless 兼容与用户名防注入 ----------------
+sb=$(setup_sandbox u14)
+printf 'WEB_PORT=8080\n' > "$sb/.env"
+chmod 600 "$sb/.env"
+dlog="$sb/ops-docker.log"
+ok_u14=1
+
+(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" MOCK_DOCKER_LOG="$dlog" \
+    SCCLOUD_ROOTLESS=1 sh ./scripts/sccloud-ops.sh status >/dev/null 2>&1
+)
+grep -q -- '-f docker-compose.yml -f docker-compose.rootless.yml ps' "$dlog" || { fail "U14" "SCCLOUD_ROOTLESS=1 overlay missing"; ok_u14=0; }
+
+: > "$dlog"
+(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" MOCK_DOCKER_LOG="$dlog" \
+    SCLOUD_ROOTLESS=1 sh ./scripts/sccloud-ops.sh status >/dev/null 2>&1
+)
+grep -q -- '-f docker-compose.yml -f docker-compose.rootless.yml ps' "$dlog" || { fail "U14" "legacy SCLOUD_ROOTLESS=1 overlay missing"; ok_u14=0; }
+
+: > "$dlog"
+(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" MOCK_DOCKER_LOG="$dlog" MOCK_DOCKER_ROOTLESS=1 \
+    SCCLOUD_ROOTLESS=0 sh ./scripts/sccloud-ops.sh status >/dev/null 2>&1
+)
+if grep -q 'docker-compose.rootless.yml' "$dlog"; then
+  fail "U14" "SCCLOUD_ROOTLESS=0 should disable rootless overlay"
+  ok_u14=0
+fi
+
+: > "$dlog"
+bad_out=$(
+  cd "$sb" && \
+  env PATH="$sb/fake-bin:$PATH" MOCK_DOCKER_LOG="$dlog" \
+    sh ./scripts/sccloud-ops.sh promote-admin "bad'; DROP TABLE users;--" 2>&1
+)
+bad_rc=$?
+[ "$bad_rc" -ne 0 ] || { fail "U14" "expected invalid username to be rejected"; ok_u14=0; }
+assert_contains "U14" "$bad_out" "非法用户名" || ok_u14=0
+if grep -q 'exec' "$dlog"; then
+  fail "U14" "invalid username should be rejected before docker compose exec"
+  ok_u14=0
+fi
+[ "$ok_u14" = "1" ] && pass "U14: sccloud-ops.sh 支持 SCCLOUD_ROOTLESS/SCLOUD_ROOTLESS 且拦截非法用户名"
+
+echo ""
+printf 'Summary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
+[ "$FAIL_COUNT" -eq 0 ]
