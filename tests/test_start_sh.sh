@@ -174,10 +174,14 @@ if [ "${1:-}" = "run" ]; then
     prev="$a"
   done
   case " $* " in
-    *"cp -a /src/. /dst/"*)
+    *'cp -a "$e" /dst/'*)
       if [ -n "$dst_host" ] && [ -n "${MOCK_LEGACY_VOLUME_SRC:-}" ] && [ -d "$MOCK_LEGACY_VOLUME_SRC" ]; then
         mkdir -p "$dst_host"
-        cp -a "$MOCK_LEGACY_VOLUME_SRC/." "$dst_host/"
+        for e in "$MOCK_LEGACY_VOLUME_SRC"/* "$MOCK_LEGACY_VOLUME_SRC"/.[!.]* "$MOCK_LEGACY_VOLUME_SRC"/..?*; do
+          if [ -e "$e" ] || [ -L "$e" ]; then
+            cp -a "$e" "$dst_host/" || exit 1
+          fi
+        done
       fi
       exit 0
       ;;
@@ -868,6 +872,7 @@ assert_contains "U22" "$out" "旧卷数据已复制到" || ok_u22=0
 
 # ---------------- U23: sccloud-ops.sh migrate-projects-dir 支持自定义目录且默认不重复覆盖 ----------------
 sb=$(setup_sandbox u23)
+dlog="$sb/docker.log"
 legacy_src="$sb/mock_legacy_vol"
 custom_dst="$sb/custom_projects_dir"
 mkdir -p "$legacy_src/15/1118"
@@ -877,6 +882,7 @@ out1=$(
   cd "$sb" && \
   PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
     PROJECTS_DATA_DIR="$custom_dst" \
+    MOCK_DOCKER_LOG="$dlog" \
     MOCK_ALL_LOCAL_IMAGES=1 MOCK_LEGACY_PROJECTS_VOLUME=1 MOCK_LEGACY_VOLUME_SRC="$legacy_src" \
     sh ./scripts/sccloud-ops.sh migrate-projects-dir 2>&1
 )
@@ -886,6 +892,7 @@ out2=$(
   cd "$sb" && \
   PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
     PROJECTS_DATA_DIR="$custom_dst" \
+    MOCK_DOCKER_LOG="$dlog" \
     MOCK_ALL_LOCAL_IMAGES=1 MOCK_LEGACY_PROJECTS_VOLUME=1 MOCK_LEGACY_VOLUME_SRC="$legacy_src" \
     sh ./scripts/sccloud-ops.sh migrate-projects-dir 2>&1
 )
@@ -894,9 +901,13 @@ ok_u23=1
 [ "$rc1" -eq 0 ] || { fail "U23" "first migrate failed rc=$rc1"; ok_u23=0; }
 [ "$rc2" -eq 0 ] || { fail "U23" "second migrate failed rc=$rc2"; ok_u23=0; }
 [ "$(cat "$custom_dst/15/1118/data.txt" 2>/dev/null || true)" = "v1" ] || { fail "U23" "second run without --force should not overwrite"; ok_u23=0; }
+if grep -Fq 'cp -a /src/. /dst/' "$dlog" 2>/dev/null; then
+  fail "U23" "must copy children instead of /src/. so /dst root ownership is preserved"
+  ok_u23=0
+fi
 assert_contains "U23" "$out1" "迁移完成" || ok_u23=0
 assert_contains "U23" "$out2" "已存在项目数据，跳过覆盖" || ok_u23=0
-[ "$ok_u23" = "1" ] && pass "U23: sccloud-ops.sh migrate-projects-dir 迁移到自定义目录并幂等防覆盖"
+[ "$ok_u23" = "1" ] && pass "U23: sccloud-ops.sh migrate-projects-dir 迁移到自定义目录、保留根属主并幂等防覆盖"
 
 echo ""
 printf 'Summary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
