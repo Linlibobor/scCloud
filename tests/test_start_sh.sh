@@ -154,6 +154,42 @@ if [ "${1:-}" = "tag" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "volume" ] && [ "${2:-}" = "inspect" ]; then
+  if [ "${3:-}" = "sccloud_projects_data" ] && [ "${MOCK_LEGACY_PROJECTS_VOLUME:-0}" = "1" ]; then
+    echo '[{"Name":"sccloud_projects_data"}]'
+    exit 0
+  fi
+  exit 1
+fi
+
+if [ "${1:-}" = "run" ]; then
+  dst_host=""
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "-v" ]; then
+      case "$a" in
+        *:/dst) dst_host="${a%:/dst}" ;;
+      esac
+    fi
+    prev="$a"
+  done
+  case " $* " in
+    *"cp -a /src/. /dst/"*)
+      if [ -n "$dst_host" ] && [ -n "${MOCK_LEGACY_VOLUME_SRC:-}" ] && [ -d "$MOCK_LEGACY_VOLUME_SRC" ]; then
+        mkdir -p "$dst_host"
+        cp -a "$MOCK_LEGACY_VOLUME_SRC/." "$dst_host/"
+      fi
+      exit 0
+      ;;
+    *)
+      if [ "${MOCK_LEGACY_PROJECTS_VOLUME:-0}" = "1" ] && [ "${MOCK_LEGACY_VOLUME_EMPTY:-0}" != "1" ]; then
+        exit 0
+      fi
+      exit 1
+      ;;
+  esac
+fi
+
 if [ "${1:-}" = "compose" ]; then
   shift
   # 跳过 --env-file / -f / -p 等前置参数
@@ -767,6 +803,100 @@ ok_u19=1
 [ ! -e "$conf_file" ] || { fail "U19" "invalid proxy URL must not write drop-in file"; ok_u19=0; }
 assert_contains "U19" "$out" "终端代理地址格式不合法" || ok_u19=0
 [ "$ok_u19" = "1" ] && pass "U19: 含非法字符的代理 URL 被安全拦截，不破坏 systemd drop-in"
+
+# ---------------- U20: 默认初始化创建 ./data/projects 脚手架与 .env PROJECTS_DATA_DIR ----------------
+sb=$(setup_sandbox u20)
+out=$(
+  cd "$sb" && \
+  PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_ALL_LOCAL_IMAGES=1 \
+    sh ./start.sh --no-pull 2>&1
+)
+rc=$?
+ok_u20=1
+[ "$rc" -eq 0 ] || { fail "U20" "expected exit 0, got $rc"; ok_u20=0; }
+[ -d "$sb/data/projects/users" ] || { fail "U20" "./data/projects/users missing"; ok_u20=0; }
+[ -d "$sb/data/projects/_tmp/exports" ] || { fail "U20" "./data/projects/_tmp/exports missing"; ok_u20=0; }
+[ -d "$sb/data/projects/_tmp/chunks" ] || { fail "U20" "./data/projects/_tmp/chunks missing"; ok_u20=0; }
+[ -d "$sb/data/projects/_tmp/inspect" ] || { fail "U20" "./data/projects/_tmp/inspect missing"; ok_u20=0; }
+grep -q '^PROJECTS_DATA_DIR=./data/projects$' "$sb/.env" || { fail "U20" "PROJECTS_DATA_DIR missing in .env"; ok_u20=0; }
+assert_contains "U20" "$out" "项目数据目录：${sb}/data/projects" || ok_u20=0
+[ "$ok_u20" = "1" ] && pass "U20: 一键启动自动初始化 ./data/projects/{users,_tmp/*} 并写入 PROJECTS_DATA_DIR"
+
+# ---------------- U21: 非交互模式下检测到非空旧卷 sccloud_projects_data 拦截 compose up ----------------
+sb=$(setup_sandbox u21)
+dlog="$sb/docker.log"
+out=$(
+  cd "$sb" && \
+  PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    MOCK_DOCKER_LOG="$dlog" MOCK_ALL_LOCAL_IMAGES=1 \
+    MOCK_LEGACY_PROJECTS_VOLUME=1 \
+    sh ./start.sh --no-pull </dev/null 2>&1
+)
+rc=$?
+ok_u21=1
+[ "$rc" -ne 0 ] || { fail "U21" "expected non-zero exit when legacy volume not migrated"; ok_u21=0; }
+assert_contains "U21" "$out" "sccloud_projects_data" || ok_u21=0
+assert_contains "U21" "$out" "migrate-projects-dir" || ok_u21=0
+if grep -Eq '^compose .* up -d' "$dlog" 2>/dev/null; then
+  fail "U21" "compose up -d must NOT run when legacy volume migration is pending"
+  ok_u21=0
+fi
+[ "$ok_u21" = "1" ] && pass "U21: 非交互模式检测到未迁移旧命名卷时安全拦截，不以空目录覆盖启动"
+
+# ---------------- U22: 交互模式确认 y 自动将旧卷数据无损复制到 ./data/projects 后继续启动 ----------------
+sb=$(setup_sandbox u22)
+dlog="$sb/docker.log"
+legacy_src="$sb/mock_legacy_vol"
+mkdir -p "$legacy_src/6/0903"
+printf 'legacy-ok\n' > "$legacy_src/6/0903/marker.txt"
+out=$(
+  cd "$sb" && \
+  printf 'y\n' | PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    SCCLOUD_ASSUME_TTY=1 \
+    MOCK_DOCKER_LOG="$dlog" MOCK_ALL_LOCAL_IMAGES=1 \
+    MOCK_LEGACY_PROJECTS_VOLUME=1 MOCK_LEGACY_VOLUME_SRC="$legacy_src" \
+    sh ./start.sh --no-pull 2>&1
+)
+rc=$?
+ok_u22=1
+[ "$rc" -eq 0 ] || { fail "U22" "expected exit 0 after interactive volume migration, got $rc"; ok_u22=0; }
+[ -f "$sb/data/projects/6/0903/marker.txt" ] || { fail "U22" "migrated file missing in ./data/projects/6/0903/marker.txt"; ok_u22=0; }
+grep -Eq '^compose .* up -d' "$dlog" || { fail "U22" "compose up -d should run after migration"; ok_u22=0; }
+assert_contains "U22" "$out" "旧卷数据已复制到" || ok_u22=0
+[ "$ok_u22" = "1" ] && pass "U22: 交互确认 y 后自动无损迁移旧命名卷到 ./data/projects 并启动服务"
+
+# ---------------- U23: sccloud-ops.sh migrate-projects-dir 支持自定义目录且默认不重复覆盖 ----------------
+sb=$(setup_sandbox u23)
+legacy_src="$sb/mock_legacy_vol"
+custom_dst="$sb/custom_projects_dir"
+mkdir -p "$legacy_src/15/1118"
+printf 'v1\n' > "$legacy_src/15/1118/data.txt"
+(cd "$sb" && PATH="$sb/fake-bin:$PATH" sh ./scripts/setup-wizard.sh >/dev/null 2>&1)
+out1=$(
+  cd "$sb" && \
+  PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    PROJECTS_DATA_DIR="$custom_dst" \
+    MOCK_ALL_LOCAL_IMAGES=1 MOCK_LEGACY_PROJECTS_VOLUME=1 MOCK_LEGACY_VOLUME_SRC="$legacy_src" \
+    sh ./scripts/sccloud-ops.sh migrate-projects-dir 2>&1
+)
+rc1=$?
+printf 'v2\n' > "$legacy_src/15/1118/data.txt"
+out2=$(
+  cd "$sb" && \
+  PATH="$sb/fake-bin:$PATH" HOME="$sb/home" \
+    PROJECTS_DATA_DIR="$custom_dst" \
+    MOCK_ALL_LOCAL_IMAGES=1 MOCK_LEGACY_PROJECTS_VOLUME=1 MOCK_LEGACY_VOLUME_SRC="$legacy_src" \
+    sh ./scripts/sccloud-ops.sh migrate-projects-dir 2>&1
+)
+rc2=$?
+ok_u23=1
+[ "$rc1" -eq 0 ] || { fail "U23" "first migrate failed rc=$rc1"; ok_u23=0; }
+[ "$rc2" -eq 0 ] || { fail "U23" "second migrate failed rc=$rc2"; ok_u23=0; }
+[ "$(cat "$custom_dst/15/1118/data.txt" 2>/dev/null || true)" = "v1" ] || { fail "U23" "second run without --force should not overwrite"; ok_u23=0; }
+assert_contains "U23" "$out1" "迁移完成" || ok_u23=0
+assert_contains "U23" "$out2" "已存在项目数据，跳过覆盖" || ok_u23=0
+[ "$ok_u23" = "1" ] && pass "U23: sccloud-ops.sh migrate-projects-dir 迁移到自定义目录并幂等防覆盖"
 
 echo ""
 printf 'Summary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"

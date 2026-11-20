@@ -117,7 +117,7 @@ services:
       BOOTSTRAP_ADMIN_USER: "${BOOTSTRAP_ADMIN_USER:-admin}"
       WORKER_MEM_CAP_GB: "${WORKER_MEM_CAP_GB:-32}"
     volumes:
-      - projects_data:${PROJECTS_ROOT:-/data/projects}
+      - ${PROJECTS_DATA_DIR:-./data/projects}:${PROJECTS_ROOT:-/data/projects}
       - ./r-engine/data:/app/r-engine-data:ro
     secrets:
       - db_password
@@ -160,7 +160,7 @@ services:
       # 由 start.sh / compose 注入带密码的 URL（见下方 redis 依赖）
       REDIS_URL: ${R_REDIS_URL:-redis://redis:6379/0}
     volumes:
-      - projects_data:${PROJECTS_ROOT:-/data/projects}
+      - ${PROJECTS_DATA_DIR:-./data/projects}:${PROJECTS_ROOT:-/data/projects}
       - ./r-engine/data:/app/data:ro
       - ./r-engine/plumber.R:/app/plumber.R:ro
       - ./r-engine/R:/app/R:ro
@@ -195,7 +195,7 @@ services:
     environment:
       REDIS_URL: ${R_REDIS_URL:-redis://redis:6379/0}
     volumes:
-      - projects_data:${PROJECTS_ROOT:-/data/projects}
+      - ${PROJECTS_DATA_DIR:-./data/projects}:${PROJECTS_ROOT:-/data/projects}
       - ./r-engine/data:/app/data:ro
       - ./r-engine/run_job.R:/app/run_job.R:ro
       - ./r-engine/worker.R:/app/worker.R:ro
@@ -284,7 +284,6 @@ services:
 
 volumes:
   db_data:
-  projects_data:
   redis_data:
 
 secrets:

@@ -35,6 +35,7 @@ user_projects/
 *.db
 r-engine/r-library/
 data/cellmakers-raw/
+data/projects/
 
 # IDE
 .vscode/

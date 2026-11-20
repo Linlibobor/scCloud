@@ -10,7 +10,9 @@ scCloud v2 — 分片上传路由
 前端使用 File.slice() 分割文件，并行/顺序上传每一片。
 """
 
+import json
 import os
+import re
 import shutil
 import uuid
 
@@ -20,11 +22,29 @@ from pydantic import BaseModel
 from app.auth.deps import get_current_user
 from app.config import get_settings
 from app.db.models import User
+from app.utils.storage_paths import (
+    ensure_dir_mode,
+    ensure_user_root,
+    is_path_within,
+    user_uploads_dir,
+)
 
 router = APIRouter(prefix="/api/upload", tags=["文件上传"])
 
-# 临时分片存储目录
-CHUNK_DIR = "/tmp/sccloud_chunks"
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _get_chunk_root() -> str:
+    """分片临时存储根目录（放在 projects_root/_tmp/chunks，避免 128MB /tmp tmpfs 满盘）。"""
+    root = get_settings().upload_chunk_dir
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _chunk_dir_for(upload_id: str) -> str:
+    if not _UPLOAD_ID_RE.match(upload_id or ""):
+        raise HTTPException(status_code=400, detail="无效的 Upload ID")
+    return os.path.join(_get_chunk_root(), upload_id)
 
 
 class InitUploadResponse(BaseModel):
@@ -83,7 +103,7 @@ async def init_upload(
         )
 
     upload_id = uuid.uuid4().hex
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     os.makedirs(chunk_dir, exist_ok=True)
 
     # 保存元数据
@@ -107,7 +127,7 @@ async def upload_chunk(
     上传单个分片。
     前端使用 File.slice(start, end) 切片后逐个上传。
     """
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
 
@@ -147,7 +167,7 @@ async def complete_upload(
             detail="操作配额使用结束，无法继续进行。",
         )
 
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
 
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
@@ -195,13 +215,13 @@ async def complete_upload(
         finally:
             db.close()
     else:
-        dest_dir = os.path.join(
+        ensure_user_root(settings.projects_root, current_user.id, current_user.username)
+        dest_dir = user_uploads_dir(
             settings.projects_root,
-            str(current_user.id),
-            "_uploads",
+            current_user.id,
+            current_user.username,
         )
-    os.makedirs(dest_dir, exist_ok=True)
-    os.chmod(dest_dir, 0o777)
+    ensure_dir_mode(dest_dir, 0o777)
 
     # 生成唯一文件名
     ext = os.path.splitext(original_filename)[1].lower()
@@ -317,7 +337,7 @@ async def inspect_file(
     通过 R 引擎 /inspect 端点解析，支持 .rds, .h5ad, .h5seurat 格式。
     """
 
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
 
@@ -338,10 +358,11 @@ async def inspect_file(
     if not chunk_files:
         raise HTTPException(status_code=400, detail="没有分片数据")
 
-    # 创建临时文件（放在共享卷中，R 引擎容器也能访问）
+    # 创建临时文件（放在共享卷 _tmp/inspect 中，R 引擎容器也能访问）
     settings = get_settings()
-    tmp_dir = os.path.join(settings.projects_root, "_inspect_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_dir = settings.inspect_tmp_dir
+    ensure_dir_mode(settings.tmp_root, 0o777)
+    ensure_dir_mode(tmp_dir, 0o777)
 
     ext = os.path.splitext(original_filename)[1].lower()
     tmp_path = os.path.join(tmp_dir, f"{upload_id}{ext}")
@@ -468,7 +489,7 @@ async def upload_status(
     current_user: User = Depends(get_current_user),
 ):
     """查询上传进度 — 返回已接收的分片数量。"""
-    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    chunk_dir = _chunk_dir_for(upload_id)
     if not os.path.exists(chunk_dir):
         raise HTTPException(status_code=404, detail="Upload ID 不存在")
 
@@ -503,7 +524,7 @@ async def inspect_file_by_path(
             .all()
         )
         allowed = any(
-            file_path.startswith(p.storage_path) for p in user_projects if p.storage_path
+            is_path_within(file_path, p.storage_path) for p in user_projects if p.storage_path
         )
         if not allowed:
             raise HTTPException(status_code=403, detail="无权访问该文件路径")

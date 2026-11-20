@@ -76,18 +76,51 @@ if [ -n "$BOOT_PASS" ]; then
   export BOOTSTRAP_ADMIN_PASSWORD="$BOOT_PASS"
 fi
 
-# 项目数据目录可写（named volume 首次可能是 root）
+# 项目数据目录与大临时目录可写（兼容宿主 bind mount ./data/projects 与命名卷；不对整个项目树做递归 chown -R）
 PROJECTS_ROOT_VAL="${PROJECTS_ROOT:-/data/projects}"
+BACKEND_USERS_DIR="${PROJECTS_ROOT_VAL}/users"
+BACKEND_TMP_DIR="${PROJECTS_ROOT_VAL}/_tmp"
 if [ "$(id -u)" = "0" ]; then
   if [ -d "$PROJECTS_ROOT_VAL" ]; then
-    chown -R 10001:10001 "$PROJECTS_ROOT_VAL" 2>/dev/null || chmod 777 "$PROJECTS_ROOT_VAL" 2>/dev/null || true
+    mkdir -p \
+      "$BACKEND_USERS_DIR" \
+      "$BACKEND_TMP_DIR" \
+      "$BACKEND_TMP_DIR/exports" \
+      "$BACKEND_TMP_DIR/chunks" \
+      "$BACKEND_TMP_DIR/inspect" 2>/dev/null || true
+    # 仅放宽顶层挂载点与脚手架子目录权限，使 backend(10001) 与 r-engine(1000) 均可读写，
+    # 同时保留宿主机 ./data/projects 根目录属主且避免大目录递归 chown 耗时。
+    chmod 0777 \
+      "$PROJECTS_ROOT_VAL" \
+      "$BACKEND_USERS_DIR" \
+      "$BACKEND_TMP_DIR" \
+      "$BACKEND_TMP_DIR/exports" \
+      "$BACKEND_TMP_DIR/chunks" \
+      "$BACKEND_TMP_DIR/inspect" 2>/dev/null || true
+  fi
+  # 将 Python tempfile / Starlette SpooledTemporaryFile 默认临时目录导向持久化卷，避免撑爆 128MB /tmp tmpfs
+  if [ -z "${TMPDIR:-}" ] && [ -d "$BACKEND_TMP_DIR" ]; then
+    export TMPDIR="$BACKEND_TMP_DIR"
   fi
   # drop to app user when possible
   if command -v setpriv >/dev/null 2>&1; then
+    if [ -d "$PROJECTS_ROOT_VAL" ] && ! setpriv --reuid=10001 --regid=10001 --clear-groups -- test -w "$PROJECTS_ROOT_VAL" 2>/dev/null; then
+      echo "docker-entrypoint: warning: $PROJECTS_ROOT_VAL is not writable by uid 10001; run 'chmod 0777 <PROJECTS_DATA_DIR>' on host" >&2
+    fi
     exec setpriv --reuid=10001 --regid=10001 --clear-groups -- "$@"
   fi
   if command -v runuser >/dev/null 2>&1; then
     exec runuser -u app -- "$@"
+  fi
+elif [ -d "$PROJECTS_ROOT_VAL" ]; then
+  mkdir -p \
+    "$BACKEND_USERS_DIR" \
+    "$BACKEND_TMP_DIR" \
+    "$BACKEND_TMP_DIR/exports" \
+    "$BACKEND_TMP_DIR/chunks" \
+    "$BACKEND_TMP_DIR/inspect" 2>/dev/null || true
+  if [ -z "${TMPDIR:-}" ] && [ -d "$BACKEND_TMP_DIR" ] && [ -w "$BACKEND_TMP_DIR" ]; then
+    export TMPDIR="$BACKEND_TMP_DIR"
   fi
 fi
 

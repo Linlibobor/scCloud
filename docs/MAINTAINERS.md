@@ -102,7 +102,7 @@ docker compose --env-file .env.server -f docker-compose.server.yml up -d --build
 
 - DB / JWT / Redis / bootstrap 管理员密码在 **`./secrets/`**，compose secrets 挂载  
 - `R_REDIS_URL` 由向导/start 按 redis 密码生成  
-- `PROJECTS_ROOT` 默认 `/data/projects`；桥接栈多为 named volume `projects_data`  
+- `PROJECTS_DATA_DIR` 默认 `./data/projects`（宿主机项目数据落盘目录，收口在仓库目录内，避免占满普通服务器 `/var/lib/docker` 根盘；可按需改为绝对路径）；`PROJECTS_ROOT` 默认 `/data/projects`（容器内固定挂载点）  
 - `SCCLOUD_ROOTLESS=1|0`（兼容旧名 `SCLOUD_ROOTLESS`）控制是否叠加 `docker-compose.rootless.yml`（默认在 rootless Docker 下自动叠加；监听地址统一由 `.env` 的 `WEB_BIND_ADDRESS` 控制）  
 - 基础镜像支持通过 `.env` 覆盖：`NGINX_IMAGE`、`MARIADB_IMAGE`、`REDIS_IMAGE`（默认钉 digest）  
 - 安全：`no-new-privileges`、`cap_drop`；部分服务 `read_only`；基础镜像钉 digest  
@@ -110,14 +110,24 @@ docker compose --env-file .env.server -f docker-compose.server.yml up -d --build
 ## 项目数据路径
 
 ```text
-/data/projects/{user.id}/{project_name}/
-  _uploaded/    # 上传
-  ...           # 分析结果
+./data/projects/                                  # 容器内固定挂为 /data/projects
+├── users/
+│   └── {username}_u{user_id}/
+│       ├── {project_name}/                       # 方案 A：最末级保持项目名，R 引擎产物前缀不变
+│       │   ├── _uploaded/                        # 上传数据
+│       │   └── ...                               # 分析结果
+│       ├── _uploads/                             # 未绑定项目时的分片上传
+│       └── _convert/                             # 格式转换临时目录
+└── _tmp/
+    ├── exports/                                  # 导出 ZIP 临时目录
+    ├── chunks/                                   # 分片上传暂存目录
+    └── inspect/                                  # R inspect 临时合并目录
 ```
 
-- 游客：`guest_<uuid>`，`user.id` 仍为数字目录；默认短保留（见 `ROLE_DEFAULTS`）  
-- `storage_path` 存在 DB；更换 volume / `PROJECTS_ROOT` 后旧路径会失效  
-- server 栈常 bind 宿主机大盘；与一键 named volume **不要混用同一套 DB 却不迁文件**  
+- 游客：`guest_<uuid8>`，目录为 `users/guest_<uuid8>_u{user_id}/`；默认短保留（见 `ROLE_DEFAULTS`）  
+- **老新共存**：历史项目 DB 中已记录的 `/data/projects/{user_id}/{project_name}` 继续按 `storage_path` 正常访问；`storage_paths.py` 的归属校验同时兼容新目录、游客升级前历史目录与旧版数字目录  
+- **旧卷迁移**：老部署从命名卷 `sccloud_projects_data` 升级时，`start.sh` 会拦截空目录覆盖并引导运行 `sh ./scripts/sccloud-ops.sh migrate-projects-dir` 无损复制到 `PROJECTS_DATA_DIR`  
+- **注意**：`storage_path` 存的是容器内路径（`/data/projects/...`），因此只要保持 `PROJECTS_ROOT=/data/projects` 不变，宿主机迁移 `PROJECTS_DATA_DIR` 无需改库；但 server 栈与一键栈仍**不要混用同一套 DB 却不迁文件**  
 
 ## 不用 start.sh
 

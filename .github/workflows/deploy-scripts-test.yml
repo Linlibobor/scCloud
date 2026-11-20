@@ -73,3 +73,9 @@ jobs:
             docker compose --env-file .env.example config | grep -q 'image: example.com/mariadb:11'
           NGINX_IMAGE=example.com/nginx:1 MARIADB_IMAGE=example.com/mariadb:11 REDIS_IMAGE=example.com/redis:7 \
             docker compose --env-file .env.example config | grep -q 'image: example.com/redis:7'
+
+          # Default local bind mount ./data/projects and custom PROJECTS_DATA_DIR override
+          docker compose --env-file .env.example config | grep -q 'data/projects'
+          ! docker compose --env-file .env.example config | grep -q 'source: projects_data'
+          PROJECTS_DATA_DIR=/mnt/sccloud-projects docker compose --env-file .env.example config \
+            | grep -q 'source: /mnt/sccloud-projects'

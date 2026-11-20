@@ -36,6 +36,7 @@ CALLER_WEB_PORT="${WEB_PORT:-}"
 CALLER_WEB_BIND="${WEB_BIND_ADDRESS:-}"
 CALLER_COMPOSE_FILE="${COMPOSE_FILE:-}"
 CALLER_ROOTLESS="${SCCLOUD_ROOTLESS:-${SCLOUD_ROOTLESS:-}}"
+CALLER_PROJECTS_DATA_DIR="${PROJECTS_DATA_DIR:-}"
 
 DO_BUILD=0
 DO_PULL=1
@@ -570,10 +571,132 @@ check_dir_space() {
   fi
 }
 
+resolve_projects_data_dir() {
+  raw="${PROJECTS_DATA_DIR:-./data/projects}"
+  case "$raw" in
+    /*) printf '%s' "$raw" ;;
+    ./*) printf '%s/%s' "$PROJECT_DIR" "${raw#./}" ;;
+    *) printf '%s/%s' "$PROJECT_DIR" "$raw" ;;
+  esac
+}
+
+ensure_projects_data_dir() {
+  target=$(resolve_projects_data_dir)
+  mkdir -p \
+    "$target" \
+    "$target/users" \
+    "$target/_tmp" \
+    "$target/_tmp/exports" \
+    "$target/_tmp/chunks" \
+    "$target/_tmp/inspect" 2>/dev/null || true
+  chmod 0777 \
+    "$target" \
+    "$target/users" \
+    "$target/_tmp" \
+    "$target/_tmp/exports" \
+    "$target/_tmp/chunks" \
+    "$target/_tmp/inspect" 2>/dev/null || true
+}
+
+projects_data_dir_has_data() {
+  dir=$1
+  [ -d "$dir" ] || return 1
+  for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    base=$(basename "$entry")
+    case "$base" in
+      users|_tmp) continue ;;
+      *) return 0 ;;
+    esac
+  done
+  if [ -d "$dir/users" ]; then
+    for entry in "$dir/users"/* "$dir/users"/.[!.]* "$dir/users"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      return 0
+    done
+  fi
+  return 1
+}
+
+pick_volume_helper_image() {
+  for cand in \
+    "${BACKEND_IMAGE:-$DEFAULT_BACKEND_IMAGE}" \
+    "$DEFAULT_BACKEND_IMAGE" \
+    "${REDIS_IMAGE:-$DEFAULT_REDIS_IMAGE}" \
+    "${NGINX_IMAGE:-$DEFAULT_NGINX_IMAGE}" \
+    "alpine:latest" \
+    "busybox:latest"
+  do
+    [ -n "$cand" ] || continue
+    if run_docker image inspect "$cand" >/dev/null 2>&1; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+legacy_projects_volume_has_data() {
+  run_docker volume inspect sccloud_projects_data >/dev/null 2>&1 || return 1
+  helper_img=$(pick_volume_helper_image) || return 0
+  # shellcheck disable=SC2016
+  run_docker run --rm -v "sccloud_projects_data:/src:ro" --entrypoint /bin/sh "$helper_img" \
+    -c 'for e in /src/* /src/.[!.]* /src/..?*; do if [ -e "$e" ] || [ -L "$e" ]; then exit 0; fi; done; exit 1' \
+    >/dev/null 2>&1
+}
+
+check_legacy_projects_volume_migration() {
+  [ "${SCCLOUD_SKIP_VOLUME_MIGRATION_CHECK:-0}" = "1" ] && return 0
+  target=$(resolve_projects_data_dir)
+  if projects_data_dir_has_data "$target"; then
+    return 0
+  fi
+  if ! legacy_projects_volume_has_data; then
+    return 0
+  fi
+
+  warn "检测到旧版 Docker 命名卷 sccloud_projects_data 存有项目数据，而当前目标目录 ${target} 尚无项目数据。"
+  warn "新版一键部署默认将项目数据直接落盘在 ${PROJECTS_DATA_DIR:-./data/projects}（不再使用命名卷 projects_data）。"
+  if { [ -t 0 ] && [ -t 2 ]; } || [ "${SCCLOUD_ASSUME_TTY:-0}" = "1" ]; then
+    printf '是否现在将旧卷 sccloud_projects_data 无损复制到 %s？（旧卷保留作备份） [y/N] ' "$target" >&2
+    ans=""
+    IFS= read -r ans || ans=""
+    case "$ans" in
+      y|Y|yes|YES)
+        PROJECTS_DATA_DIR="${PROJECTS_DATA_DIR:-./data/projects}" sh ./scripts/sccloud-ops.sh migrate-projects-dir \
+          || die "旧卷迁移失败，请手动排查后重试"
+        ok "旧卷数据已复制到 ${target}，继续启动服务"
+        return 0
+        ;;
+      *)
+        die "已中止启动（避免以空目录掩盖旧卷数据）。请先执行 sh ./scripts/sccloud-ops.sh migrate-projects-dir 后再运行 sh ./start.sh"
+        ;;
+    esac
+  else
+    cat >&2 <<EOF
+  为避免已有项目变成 404，已中止启动。请按以下步骤完成无损迁移（旧卷保留作备份）：
+    sh ./scripts/sccloud-ops.sh migrate-projects-dir
+    sh ./start.sh
+  （若确认不需要旧卷数据，可设置 SCCLOUD_SKIP_VOLUME_MIGRATION_CHECK=1 后重试）
+EOF
+    die "检测到未迁移的旧项目数据卷 sccloud_projects_data"
+  fi
+}
+
 check_disk_space() {
   check_dir_space "." "项目目录"
-  if [ -n "$DOCKER_ROOT_DIR" ] && [ -d "$DOCKER_ROOT_DIR" ] && command -v df >/dev/null 2>&1; then
+  proj_fs=""
+  if command -v df >/dev/null 2>&1; then
     proj_fs=$(df -Pk . 2>/dev/null | awk 'NR==2{print $1}') || proj_fs=""
+  fi
+  data_dir=$(resolve_projects_data_dir)
+  if [ -d "$data_dir" ] && command -v df >/dev/null 2>&1; then
+    data_fs=$(df -Pk "$data_dir" 2>/dev/null | awk 'NR==2{print $1}') || data_fs=""
+    if [ -n "$data_fs" ] && [ "$data_fs" != "$proj_fs" ]; then
+      check_dir_space "$data_dir" "项目数据目录"
+    fi
+  fi
+  if [ -n "$DOCKER_ROOT_DIR" ] && [ -d "$DOCKER_ROOT_DIR" ] && command -v df >/dev/null 2>&1; then
     docker_fs=$(df -Pk "$DOCKER_ROOT_DIR" 2>/dev/null | awk 'NR==2{print $1}') || docker_fs=""
     if [ -n "$docker_fs" ] && [ "$docker_fs" != "$proj_fs" ]; then
       check_dir_space "$DOCKER_ROOT_DIR" "Docker 数据目录"
@@ -933,6 +1056,7 @@ print_access_info() {
   [ "$WEB_BIND" != "0.0.0.0" ] && health_host="$WEB_BIND"
   echo ""
   echo "健康检查：http://${health_host}:${WEB_PORT}/healthz"
+  echo "项目数据目录：$(resolve_projects_data_dir)"
   echo ""
   echo "默认管理员（仅空库首次启动创建）："
   echo "  用户：${admin_user}"
@@ -1011,12 +1135,20 @@ run_doctor() {
   [ -n "$CALLER_COMPOSE_FILE" ] && COMPOSE_FILE="$CALLER_COMPOSE_FILE"
   [ -n "$CALLER_WEB_PORT" ] && WEB_PORT="$CALLER_WEB_PORT"
   [ -n "$CALLER_WEB_BIND" ] && WEB_BIND_ADDRESS="$CALLER_WEB_BIND"
+  [ -n "$CALLER_PROJECTS_DATA_DIR" ] && PROJECTS_DATA_DIR="$CALLER_PROJECTS_DATA_DIR"
   WEB_PORT="${WEB_PORT:-8080}"
   WEB_BIND="${WEB_BIND_ADDRESS:-0.0.0.0}"
+  PROJECTS_DATA_DIR="${PROJECTS_DATA_DIR:-./data/projects}"
 
   setup_compose_mode
+  info "项目数据目录：$(resolve_projects_data_dir)"
   check_disk_space
   check_rootless_mounts
+  if [ "$DOCKER_READY" = "1" ] && ! projects_data_dir_has_data "$(resolve_projects_data_dir)"; then
+    if run_docker volume inspect sccloud_projects_data >/dev/null 2>&1; then
+      warn "检测到旧命名卷 sccloud_projects_data；若其中有历史项目，升级启动前请先执行 sh ./scripts/sccloud-ops.sh migrate-projects-dir"
+    fi
+  fi
   check_docker_proxy
 
   info "检测仓库连通性（当前终端网络视角；实际拉取取决于 Docker daemon 代理）："
@@ -1141,7 +1273,9 @@ set -a
 set +a
 WEB_PORT="${WEB_PORT:-8080}"
 WEB_BIND="${WEB_BIND_ADDRESS:-0.0.0.0}"
-export WEB_PORT WEB_BIND_ADDRESS
+[ -n "$CALLER_PROJECTS_DATA_DIR" ] && PROJECTS_DATA_DIR="$CALLER_PROJECTS_DATA_DIR"
+PROJECTS_DATA_DIR="${PROJECTS_DATA_DIR:-./data/projects}"
+export WEB_PORT WEB_BIND_ADDRESS PROJECTS_DATA_DIR
 if [ -s ./secrets/redis-password ]; then
   _rp=$(tr -d '\r\n' < ./secrets/redis-password)
   export R_REDIS_URL="redis://:${_rp}@redis:6379/0"
@@ -1204,6 +1338,9 @@ else
 fi
 
 [ "$build_ok" = "1" ] || die "镜像准备失败"
+
+ensure_projects_data_dir
+check_legacy_projects_volume_migration
 
 info "启动服务..."
 run_compose up -d || {

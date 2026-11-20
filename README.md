@@ -152,9 +152,16 @@ sh ./start.sh --build        # 本地构建（一般用户不需要；无需 r-e
 
 ## 数据存储
 
-- **账号、项目名、任务状态**：存在数据库里（Docker 卷，随 compose 项目保留）。  
-- **表达矩阵、分析结果等大文件**：在统一的数据卷中，容器内路径为 `/data/projects`，按用户与项目分目录。  
-- 执行 `docker compose down -v` 或删除相关 volume **会清空数据库和项目文件**，生产环境请先备份。  
+- **账号、项目名、任务状态**：存在数据库里（Docker 卷 `db_data` / `redis_data`，随 compose 项目保留）。  
+- **表达矩阵、分析结果与导出/上传临时文件**：默认直接落在项目目录内 **`./data/projects`**（可通过 `.env` 中 `PROJECTS_DATA_DIR` 改为独立大盘路径，容器内固定挂载 `/data/projects`，搬迁宿主目录无需修改数据库）。目录结构：
+  ```text
+  ./data/projects/
+  ├── users/{username}_u{user_id}/{project_name}/   # 用户与项目数据（可读且无碰撞）
+  └── _tmp/{exports,chunks,inspect}/                # 导出 ZIP、分片上传与临时缓冲（自动定期清理）
+  ```
+- **老版本升级迁移**：如果你此前使用过旧版 Docker 命名卷 `sccloud_projects_data`，升级后运行 `sh ./start.sh` 会自动检测并引导通过 `sh ./scripts/sccloud-ops.sh migrate-projects-dir` 将旧数据无损复制到 `./data/projects`（旧卷保留作备份；老项目路径与新目录结构共存兼容）。  
+- **Rootless Docker 宿主机清理提示**：容器内非 root 进程在 `./data/projects` 中创建的子文件在宿主机上归对应 subuid 所有，如需在宿主机手工删除整个目录可执行 `docker unshare rm -rf ./data/projects`。  
+- 执行 `docker compose down -v` 或删除数据库 volume **会清空账号与元数据**，生产环境请先备份。  
 - 游客账号若开放，数据保留时间较短，重要分析请注册正式用户。
 
 ## 常见问题

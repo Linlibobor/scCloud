@@ -26,6 +26,12 @@ from sqlalchemy.orm import Session
 from app.auth.deps import get_current_user
 from app.config import get_settings
 from app.db.models import User, get_db
+from app.utils.storage_paths import (
+    ensure_dir_mode,
+    ensure_user_root,
+    is_path_owned_by_user,
+    user_convert_dir,
+)
 
 RDS_EXTENSIONS = {".rds", ".h5ad", ".h5seurat", ".h5", ".rdata", ".loom"}
 
@@ -88,13 +94,13 @@ async def upload_for_convert(
         )
 
     # 存储到用户的 _convert 临时目录
-    upload_dir = os.path.join(
+    ensure_user_root(settings.projects_root, current_user.id, current_user.username)
+    upload_dir = user_convert_dir(
         settings.projects_root,
-        str(current_user.id),
-        "_convert",
+        current_user.id,
+        current_user.username,
     )
-    os.makedirs(upload_dir, exist_ok=True)
-    os.chmod(upload_dir, 0o777)
+    ensure_dir_mode(upload_dir, 0o777)
 
     filename = f"{uuid.uuid4().hex}{ext}"
     filepath = os.path.join(upload_dir, filename)
@@ -218,14 +224,18 @@ async def mtx_merge(
     is_single_file = all(ext in RDS_EXTENSIONS for ext in file_extensions)
 
     # 存储目录
-    merge_dir = os.path.join(
+    ensure_user_root(settings.projects_root, current_user.id, current_user.username)
+    convert_root = user_convert_dir(
         settings.projects_root,
-        str(current_user.id),
-        "_convert",
+        current_user.id,
+        current_user.username,
+    )
+    ensure_dir_mode(convert_root, 0o777)
+    merge_dir = os.path.join(
+        convert_root,
         f"mtx_merge_{uuid.uuid4().hex[:8]}",
     )
-    os.makedirs(merge_dir, exist_ok=True)
-    os.chmod(merge_dir, 0o777)
+    ensure_dir_mode(merge_dir, 0o777)
 
     if all_zip:
         # === 10X MTX ZIP 模式（原有逻辑）===
@@ -372,10 +382,14 @@ async def download_converted(
     """下载转换后的文件。"""
     settings = get_settings()
 
-    # 安全检查: 路径必须在用户目录下
-    user_root = os.path.join(settings.projects_root, str(current_user.id))
-    abs_path = os.path.abspath(path)
-    if not abs_path.startswith(os.path.abspath(user_root)):
+    # 安全检查: 路径必须严格位于当前用户归属目录下（兼容新旧目录与游客升级，并防前缀穿透）
+    abs_path = os.path.realpath(path)
+    if not is_path_owned_by_user(
+        abs_path,
+        settings.projects_root,
+        current_user.id,
+        current_user.username,
+    ):
         raise HTTPException(status_code=403, detail="无权访问此文件")
 
     if not os.path.isfile(abs_path):
