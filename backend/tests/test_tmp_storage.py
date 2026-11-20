@@ -108,6 +108,7 @@ class TestBackendTmpStorage(unittest.IsolatedAsyncioTestCase):
 
     def test_settings_tmp_paths_under_projects_root(self) -> None:
         settings = get_settings()
+        self.assertEqual(settings.users_root, os.path.join(self.projects_root, "users"))
         self.assertEqual(settings.tmp_root, os.path.join(self.projects_root, "_tmp"))
         self.assertEqual(
             settings.export_tmp_dir,
@@ -116,6 +117,10 @@ class TestBackendTmpStorage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             settings.upload_chunk_dir,
             os.path.join(self.projects_root, "_tmp", "chunks"),
+        )
+        self.assertEqual(
+            settings.inspect_tmp_dir,
+            os.path.join(self.projects_root, "_tmp", "inspect"),
         )
 
     async def test_download_project_uses_export_tmp_dir_and_cleans_up(self) -> None:
@@ -382,6 +387,8 @@ class TestBackendTmpStorage(unittest.IsolatedAsyncioTestCase):
 
     def test_docker_entrypoint_sets_tmpdir(self) -> None:
         entrypoint = Path(__file__).resolve().parents[1] / "scripts" / "docker-entrypoint.sh"
+        # 当测试以 uid 0 运行时，entrypoint 会降权到 uid 10001，需确保临时父目录可穿越
+        os.chmod(self._tmpdir.name, 0o755)
         base_env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "DATABASE_URL": "sqlite:///:memory:",
@@ -407,12 +414,15 @@ class TestBackendTmpStorage(unittest.IsolatedAsyncioTestCase):
         lines = proc.stdout.strip().splitlines()
         expected_tmp = os.path.join(self.projects_root, "_tmp")
         self.assertEqual(lines, [expected_tmp, expected_tmp])
+        self.assertTrue(os.path.isdir(os.path.join(self.projects_root, "users")))
         self.assertTrue(os.path.isdir(os.path.join(expected_tmp, "exports")))
         self.assertTrue(os.path.isdir(os.path.join(expected_tmp, "chunks")))
+        self.assertTrue(os.path.isdir(os.path.join(expected_tmp, "inspect")))
 
         # 显式传入 TMPDIR 时保持用户覆盖
         custom_tmp = os.path.join(self._tmpdir.name, "custom_tmp")
         os.makedirs(custom_tmp, exist_ok=True)
+        os.chmod(custom_tmp, 0o777)
         proc2 = subprocess.run(
             [
                 "sh",

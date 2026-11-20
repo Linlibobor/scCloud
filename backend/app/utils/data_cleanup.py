@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
 from app.db.models import Project, SessionLocal, User, get_retention_days
+from app.utils.storage_paths import cleanup_empty_user_dir
 
 
 class DataCleanup:
@@ -96,7 +97,9 @@ class DataCleanup:
 
         _prune_dir(settings.export_tmp_dir, export_max_age_sec)
         _prune_dir(settings.upload_chunk_dir, chunk_max_age_sec)
+        _prune_dir(settings.inspect_tmp_dir, inspect_max_age_sec)
         _prune_dir(settings.tmp_root, export_max_age_sec, files_only=True)
+        # 兼容清理旧版本遗留在 {projects_root}/_inspect_tmp 的临时 inspect 文件
         _prune_dir(os.path.join(settings.projects_root, "_inspect_tmp"), inspect_max_age_sec)
         # 兼容清理旧版本遗留在 /tmp 的导出包与分片（仅清理 sccloud_*.zip，不误删 sccloud_chunks 目录）
         if legacy_tmp_dir:
@@ -114,6 +117,7 @@ class DataCleanup:
     def _cleanup_expired_projects(self) -> dict:
         """查询过期项目并删除（DB + 磁盘）。返回统计信息。"""
         db = SessionLocal()
+        settings = get_settings()
         deleted = 0
         freed_bytes = 0
         try:
@@ -128,14 +132,11 @@ class DataCleanup:
                     # 删磁盘
                     if p.storage_path:
                         try:
-                            import os
                             if os.path.isdir(p.storage_path):
                                 freed_bytes += _dir_size(p.storage_path)
                                 shutil.rmtree(p.storage_path, ignore_errors=True)
-                                # 清理用户级空目录
-                                parent = os.path.dirname(p.storage_path)
-                                if os.path.isdir(parent) and not os.listdir(parent):
-                                    os.rmdir(parent)
+                                # 安全清理用户级空目录（绝不误删 projects_root 或 users/）
+                                cleanup_empty_user_dir(p.storage_path, settings.projects_root)
                         except OSError:
                             pass
                     # 删 DB（cascade 自动删 tasks/pipelines）

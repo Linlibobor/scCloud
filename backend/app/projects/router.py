@@ -16,6 +16,11 @@ from app.auth.deps import get_current_user
 from fastapi.responses import FileResponse
 from app.config import get_settings
 from app.db.models import Project, User, get_db
+from app.utils.storage_paths import (
+    cleanup_empty_user_dir,
+    ensure_user_root,
+    project_storage_dir,
+)
 
 router = APIRouter(prefix="/api/projects", tags=["项目管理"])
 
@@ -119,17 +124,21 @@ async def create_project(
             detail="同名项目已存在",
         )
 
-    # 创建存储目录 (安全的路径拼接)
-    storage_path = os.path.join(
+    # 创建存储目录（方案 A：{projects_root}/users/{username}_u{user_id}/{project_name}）
+    ensure_user_root(settings.projects_root, current_user.id, current_user.username)
+    storage_path = project_storage_dir(
         settings.projects_root,
-        str(current_user.id),
+        current_user.id,
+        current_user.username,
         req.name,
     )
     os.makedirs(storage_path, exist_ok=True)
-    # 后端容器以 root 运行、经 NFS root_squash 落地为 nobody; R 引擎容器以 uid=1000(rengine) 运行。
-    # 目录归 nobody:nobody, root_squash 下后端无法 chgrp 到 gid 1000, 故只能靠 o+w(0o777) 让 R 引擎可写。
+    # 后端容器与 R 引擎容器 UID 不同（10001 vs 1000），显式放开目录权限让 R 引擎可写。
     # (不用 os.umask(0): 它是进程级、并发建目录会竞态; 这里显式 chmod 目标目录即可。)
-    os.chmod(storage_path, 0o777)
+    try:
+        os.chmod(storage_path, 0o777)
+    except OSError:
+        pass
 
     project = Project(
         name=req.name,
@@ -184,10 +193,8 @@ async def delete_project(
     # 删除磁盘文件
     if project.storage_path and os.path.isdir(project.storage_path):
         shutil.rmtree(project.storage_path, ignore_errors=True)
-        # 清理用户级空目录
-        parent = os.path.dirname(project.storage_path)
-        if os.path.isdir(parent) and not os.listdir(parent):
-            os.rmdir(parent)
+        # 安全清理用户级空目录（绝不删除 projects_root 或 users/）
+        cleanup_empty_user_dir(project.storage_path, get_settings().projects_root)
 
     db.delete(project)
     db.commit()

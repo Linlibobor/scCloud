@@ -144,6 +144,9 @@ if [ -f .env ]; then
   if ! grep -q '^BOOTSTRAP_ADMIN_USER=' .env 2>/dev/null; then
     sync_env_key BOOTSTRAP_ADMIN_USER "$DEFAULT_ADMIN_USER"
   fi
+  if ! grep -q '^PROJECTS_DATA_DIR=' .env 2>/dev/null; then
+    sync_env_key PROJECTS_DATA_DIR "./data/projects"
+  fi
   if grep -qE '^(DB_PASS|DB_ROOT_PASS|JWT_SECRET|BOOTSTRAP_ADMIN_PASSWORD)=' .env 2>/dev/null; then
     (
       umask 077
@@ -175,7 +178,28 @@ else
   ok "已从 .env.example 创建 .env（权限 600；密钥仅在 secrets/）"
 fi
 
-mkdir -p ./data/initdb.d ./data/projects 2>/dev/null || true
+PROJECTS_DATA_DIR_VAL=$(awk -F= '/^PROJECTS_DATA_DIR=/{sub(/^[^=]*=/,""); gsub(/^["'\'']|["'\'']$/,""); print; exit}' .env 2>/dev/null || true)
+[ -n "$PROJECTS_DATA_DIR_VAL" ] || PROJECTS_DATA_DIR_VAL="./data/projects"
+case "$PROJECTS_DATA_DIR_VAL" in
+  /*) PROJECTS_DATA_ABS="$PROJECTS_DATA_DIR_VAL" ;;
+  ./*) PROJECTS_DATA_ABS="${PROJECT_DIR}/${PROJECTS_DATA_DIR_VAL#./}" ;;
+  *) PROJECTS_DATA_ABS="${PROJECT_DIR}/${PROJECTS_DATA_DIR_VAL}" ;;
+esac
+
+mkdir -p ./data/initdb.d \
+  "$PROJECTS_DATA_ABS" \
+  "$PROJECTS_DATA_ABS/users" \
+  "$PROJECTS_DATA_ABS/_tmp" \
+  "$PROJECTS_DATA_ABS/_tmp/exports" \
+  "$PROJECTS_DATA_ABS/_tmp/chunks" \
+  "$PROJECTS_DATA_ABS/_tmp/inspect" 2>/dev/null || true
+chmod 0777 \
+  "$PROJECTS_DATA_ABS" \
+  "$PROJECTS_DATA_ABS/users" \
+  "$PROJECTS_DATA_ABS/_tmp" \
+  "$PROJECTS_DATA_ABS/_tmp/exports" \
+  "$PROJECTS_DATA_ABS/_tmp/chunks" \
+  "$PROJECTS_DATA_ABS/_tmp/inspect" 2>/dev/null || true
 
 BOOT_SHOW=$(tr -d '\r\n' < "$SECRETS_DIR/bootstrap-admin-password" 2>/dev/null || echo "$DEFAULT_ADMIN_PASSWORD")
 

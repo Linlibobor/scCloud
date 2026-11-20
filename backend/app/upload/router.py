@@ -22,6 +22,12 @@ from pydantic import BaseModel
 from app.auth.deps import get_current_user
 from app.config import get_settings
 from app.db.models import User
+from app.utils.storage_paths import (
+    ensure_dir_mode,
+    ensure_user_root,
+    is_path_within,
+    user_uploads_dir,
+)
 
 router = APIRouter(prefix="/api/upload", tags=["文件上传"])
 
@@ -209,13 +215,13 @@ async def complete_upload(
         finally:
             db.close()
     else:
-        dest_dir = os.path.join(
+        ensure_user_root(settings.projects_root, current_user.id, current_user.username)
+        dest_dir = user_uploads_dir(
             settings.projects_root,
-            str(current_user.id),
-            "_uploads",
+            current_user.id,
+            current_user.username,
         )
-    os.makedirs(dest_dir, exist_ok=True)
-    os.chmod(dest_dir, 0o777)
+    ensure_dir_mode(dest_dir, 0o777)
 
     # 生成唯一文件名
     ext = os.path.splitext(original_filename)[1].lower()
@@ -352,10 +358,11 @@ async def inspect_file(
     if not chunk_files:
         raise HTTPException(status_code=400, detail="没有分片数据")
 
-    # 创建临时文件（放在共享卷中，R 引擎容器也能访问）
+    # 创建临时文件（放在共享卷 _tmp/inspect 中，R 引擎容器也能访问）
     settings = get_settings()
-    tmp_dir = os.path.join(settings.projects_root, "_inspect_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_dir = settings.inspect_tmp_dir
+    ensure_dir_mode(settings.tmp_root, 0o777)
+    ensure_dir_mode(tmp_dir, 0o777)
 
     ext = os.path.splitext(original_filename)[1].lower()
     tmp_path = os.path.join(tmp_dir, f"{upload_id}{ext}")
@@ -517,7 +524,7 @@ async def inspect_file_by_path(
             .all()
         )
         allowed = any(
-            file_path.startswith(p.storage_path) for p in user_projects if p.storage_path
+            is_path_within(file_path, p.storage_path) for p in user_projects if p.storage_path
         )
         if not allowed:
             raise HTTPException(status_code=403, detail="无权访问该文件路径")

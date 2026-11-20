@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     max_upload_size_gb: int = 30
 
     @property
+    def users_root(self) -> str:
+        """用户与项目根目录：{projects_root}/users。"""
+        return os.path.join(self.projects_root, "users")
+
+    @property
     def tmp_root(self) -> str:
         """大文件临时目录（位于持久化数据卷，避免撑爆 128MB 容器 /tmp tmpfs）。"""
         return os.path.join(self.projects_root, "_tmp")
@@ -67,6 +72,10 @@ class Settings(BaseSettings):
     @property
     def upload_chunk_dir(self) -> str:
         return os.path.join(self.tmp_root, "chunks")
+
+    @property
+    def inspect_tmp_dir(self) -> str:
+        return os.path.join(self.tmp_root, "inspect")
 
     # ---- 部署 ----
     environment: str = "development"

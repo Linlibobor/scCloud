@@ -12,7 +12,9 @@ import os
 import shutil
 
 from app.auth.deps import get_admin_user
+from app.config import get_settings
 from app.db.models import User, Project, get_db
+from app.utils.storage_paths import remove_user_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -189,11 +191,12 @@ async def delete_user(
             detail="不能删除自己的账户",
         )
 
-    # 清理用户所有项目的磁盘文件
+    # 清理用户所有项目的磁盘文件与用户目录（含 _convert / _uploads 及历史旧目录）
     projects = db.query(Project).filter(Project.user_id == user.id).all()
     for p in projects:
         if p.storage_path and os.path.isdir(p.storage_path):
             shutil.rmtree(p.storage_path, ignore_errors=True)
+    remove_user_dirs(get_settings().projects_root, user.id, user.username)
 
     db.delete(user)
     db.commit()
