@@ -11,8 +11,8 @@
 
 set -u
 
-PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cd "$PROJECT_DIR"
+PROJECT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+cd "$PROJECT_DIR" || exit 1
 
 # 兼容官方 rootless Docker 默认安装路径（$HOME/bin）
 if [ -n "${HOME:-}" ] && [ -d "${HOME}/bin" ]; then
@@ -78,6 +78,7 @@ COMPOSE_DISPLAY="docker compose --env-file .env"
 PULL_LOG_FILE=""
 PULL_RC_FILE=""
 
+# shellcheck disable=SC2329
 cleanup_tmp() {
   [ -n "$PULL_LOG_FILE" ] && rm -f "$PULL_LOG_FILE" 2>/dev/null || true
   [ -n "$PULL_RC_FILE" ] && rm -f "$PULL_RC_FILE" 2>/dev/null || true
@@ -406,6 +407,7 @@ check_rootless_mounts() {
   bad_mounts=""
   for p in ./nginx/nginx.bridge.conf ./r-engine/plumber.R ./r-engine/worker.R ./r-engine/run_job.R ./r-engine/R ./r-engine/data; do
     [ -e "$p" ] || continue
+    # shellcheck disable=SC2012
     perm=$(ls -ld "$p" 2>/dev/null | awk '{print $1}')
     case "$perm" in
       d??????r?x*|d??????r?s*|d??????r?t*) ;;
@@ -755,6 +757,7 @@ run_doctor() {
   fi
 
   if [ -f .env ]; then
+    # shellcheck disable=SC2012
     env_perm=$(ls -l .env 2>/dev/null | awk '{print $1}')
     case "$env_perm" in
       -rw-------*) ok ".env 存在且权限安全（600）" ;;

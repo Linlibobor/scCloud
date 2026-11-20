@@ -4,9 +4,10 @@
 
 set -u
 
-REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/sccloud-start-tests.XXXXXX")
 SOCK_DIR=""
+# shellcheck disable=SC2329
 cleanup_tests() {
   rm -rf "$TMP_BASE"
   [ -n "$SOCK_DIR" ] && rm -rf "$SOCK_DIR"
@@ -337,6 +338,7 @@ rc=$?
 ok_u3=1
 [ "$rc" -eq 0 ] || { fail "U3" "expected exit 0, got $rc"; ok_u3=0; }
 assert_contains "U3" "$out" "Docker daemon 未配置代理" || ok_u3=0
+# shellcheck disable=SC2088
 assert_contains "U3" "$out" "~/.config/systemd/user/docker.service.d/http-proxy.conf" || ok_u3=0
 [ "$ok_u3" = "1" ] && pass "U3: 识别 Shell 与 rootless dockerd 代理错位并输出 drop-in 配置"
 
@@ -466,6 +468,7 @@ ok_u9=1
 grep -q '^FRONTEND_IMAGE=ghcr.io/cangiolo/sccloud-frontend:latest$' "$sb/.env" || { fail "U9" "FRONTEND_IMAGE not migrated"; ok_u9=0; }
 grep -q '^BACKEND_IMAGE=ghcr.io/cangiolo/sccloud-backend:latest$' "$sb/.env" || { fail "U9" "BACKEND_IMAGE not migrated"; ok_u9=0; }
 grep -q '^R_ENGINE_IMAGE=ghcr.io/cangiolo/sccloud-r-engine:latest$' "$sb/.env" || { fail "U9" "R_ENGINE_IMAGE not migrated"; ok_u9=0; }
+# shellcheck disable=SC2012
 env_perm=$(ls -l "$sb/.env" | awk '{print $1}')
 case "$env_perm" in
   -rw-------*) ;;
@@ -506,6 +509,7 @@ rc=$?
 ok_u11=1
 [ "$rc" -eq 0 ] || { fail "U11" "expected exit 0, got $rc"; ok_u11=0; }
 grep -q '^WEB_PORT=8081$' "$sb/.env" || { fail "U11" "expected WEB_PORT=8081"; ok_u11=0; }
+# shellcheck disable=SC2012
 env_perm=$(ls -l "$sb/.env" | awk '{print $1}')
 case "$env_perm" in
   -rw-------*) ;;

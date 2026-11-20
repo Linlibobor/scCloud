@@ -5,8 +5,8 @@
 
 set -u
 
-PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-cd "$PROJECT_DIR"
+PROJECT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$PROJECT_DIR" || exit 1
 
 SECRETS_DIR="./secrets"
 DEFAULT_ADMIN_USER="admin"
