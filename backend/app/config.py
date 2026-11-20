@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     projects_root: str = "/data/projects"
     max_upload_size_gb: int = 30
 
+    @property
+    def tmp_root(self) -> str:
+        """大文件临时目录（位于持久化数据卷，避免撑爆 128MB 容器 /tmp tmpfs）。"""
+        return os.path.join(self.projects_root, "_tmp")
+
+    @property
+    def export_tmp_dir(self) -> str:
+        return os.path.join(self.tmp_root, "exports")
+
+    @property
+    def upload_chunk_dir(self) -> str:
+        return os.path.join(self.tmp_root, "chunks")
+
     # ---- 部署 ----
     environment: str = "development"
 

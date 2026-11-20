@@ -76,11 +76,17 @@ if [ -n "$BOOT_PASS" ]; then
   export BOOTSTRAP_ADMIN_PASSWORD="$BOOT_PASS"
 fi
 
-# 项目数据目录可写（named volume 首次可能是 root）
+# 项目数据目录与大临时目录可写（named volume 首次可能是 root）
 PROJECTS_ROOT_VAL="${PROJECTS_ROOT:-/data/projects}"
+BACKEND_TMP_DIR="${PROJECTS_ROOT_VAL}/_tmp"
 if [ "$(id -u)" = "0" ]; then
   if [ -d "$PROJECTS_ROOT_VAL" ]; then
+    mkdir -p "$BACKEND_TMP_DIR" "$BACKEND_TMP_DIR/exports" "$BACKEND_TMP_DIR/chunks" 2>/dev/null || true
     chown -R 10001:10001 "$PROJECTS_ROOT_VAL" 2>/dev/null || chmod 777 "$PROJECTS_ROOT_VAL" 2>/dev/null || true
+  fi
+  # 将 Python tempfile / Starlette SpooledTemporaryFile 默认临时目录导向持久化卷，避免撑爆 128MB /tmp tmpfs
+  if [ -z "${TMPDIR:-}" ] && [ -d "$BACKEND_TMP_DIR" ]; then
+    export TMPDIR="$BACKEND_TMP_DIR"
   fi
   # drop to app user when possible
   if command -v setpriv >/dev/null 2>&1; then
@@ -88,6 +94,11 @@ if [ "$(id -u)" = "0" ]; then
   fi
   if command -v runuser >/dev/null 2>&1; then
     exec runuser -u app -- "$@"
+  fi
+elif [ -d "$PROJECTS_ROOT_VAL" ]; then
+  mkdir -p "$BACKEND_TMP_DIR" "$BACKEND_TMP_DIR/exports" "$BACKEND_TMP_DIR/chunks" 2>/dev/null || true
+  if [ -z "${TMPDIR:-}" ] && [ -d "$BACKEND_TMP_DIR" ] && [ -w "$BACKEND_TMP_DIR" ]; then
+    export TMPDIR="$BACKEND_TMP_DIR"
   fi
 fi
 
